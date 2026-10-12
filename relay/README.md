@@ -14,6 +14,11 @@ fake money.
 | Duplicates | Each app trade id sent once (`sent.json`) |
 | Index options (SPX) | Blocked. Webull OpenAPI doesn't support them |
 
+## Status
+- Oct 12 2026: connected to Webull **paper** OpenAPI. Working host is `api.sandbox.webull.com` with the App Key exactly as issued (including the `us.` prefix). Bot account: Individual Margin DEV8M8T6.
+- Keys + account id live in `MakeMeTrade/.webull_paper` (gitignored, chmod 600) on the Mac.
+- Mac scripts: `setup.command` (one-time), `probe.command` (read-only connection check). Run with `bash ~/AI/MakeMeTrade/<name>.command`.
+
 ## Setup (once)
 1. Apply at webull.com → avatar → **Developer Tool** → OpenAPI Management → My Application.
    The **sandbox** application auto-approves in minutes; production takes 1–2 business days.

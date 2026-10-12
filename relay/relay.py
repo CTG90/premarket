@@ -150,10 +150,13 @@ def cmd_place(args):
         print("No open paper trades with orders in this export.")
         return
     tc = host = None
+    args.account = args.account or os.environ.get("WEBULL_ACCOUNT_ID")
     if args.send:
         tc, host = client(args.live)
         if not args.account:
-            sys.exit("Pass --account <account_id> (run: relay.py accounts).")
+            sys.exit("Pass --account <account_id> or set WEBULL_ACCOUNT_ID (run: relay.py accounts).")
+        if host == LIVE_HOST and os.environ.get("WEBULL_ALLOW_LIVE") != "1":
+            sys.exit("WEBULL_HOST points at the live server. Refusing without WEBULL_ALLOW_LIVE=1.")
     for t in open_trades:
         o = dict(t["order"])
         label = f'{o["symbol"]} {o["exp"]} {o["strike"]}{o["dir"]} x{o["qty"]} @ {float(o["limit"]):.2f}'
