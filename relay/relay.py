@@ -50,16 +50,17 @@ def save_state(s):
     STATE.write_text(json.dumps(s, indent=2))
 
 
-def client(live):
+def client(live, key=None, secret=None, host=None):
     try:
         from webull.core.client import ApiClient
         from webull.trade.trade_client import TradeClient
     except ImportError:
         sys.exit("Install the SDK first: pip3 install --upgrade webull-openapi-python-sdk")
-    key, secret = os.environ.get("WEBULL_APP_KEY"), os.environ.get("WEBULL_APP_SECRET")
+    key = key or os.environ.get("WEBULL_APP_KEY")
+    secret = secret or os.environ.get("WEBULL_APP_SECRET")
     if not key or not secret:
-        sys.exit("Set WEBULL_APP_KEY and WEBULL_APP_SECRET (sandbox keys for sandbox).")
-    host = LIVE_HOST if live else SANDBOX_HOST
+        sys.exit("Set WEBULL_APP_KEY and WEBULL_APP_SECRET.")
+    host = host or os.environ.get("WEBULL_HOST") or (LIVE_HOST if live else SANDBOX_HOST)
     api = ApiClient(key, secret, REGION)
     api.add_endpoint(REGION, host)
     return TradeClient(api), host
@@ -115,6 +116,29 @@ def cmd_accounts(args):
     print(json.dumps(res.json(), indent=2))
 
 
+def cmd_probe(args):
+    """Try key/host combinations; read-only (account list). Writes probe_output.txt."""
+    import logging
+    logging.disable(logging.CRITICAL)
+    key, secret = os.environ.get("WEBULL_APP_KEY", ""), os.environ.get("WEBULL_APP_SECRET", "")
+    keys = [key] + ([key.split(".", 1)[1]] if key.lower().startswith("us.") else [])
+    lines = []
+    for k in keys:
+        for h in (SANDBOX_HOST, LIVE_HOST):
+            label = f'key={"as-is" if k == key else "without us."}  host={h}'
+            try:
+                tc, _ = client(False, k, secret, h)
+                res = tc.account_v2.get_account_list()
+                body = res.json() if res.status_code == 200 else res.text[:200]
+                ok = res.status_code == 200
+                lines.append(("OK   " if ok else "FAIL ") + label + "  ->  " + (json.dumps(body)[:1500] if ok else str(body)))
+            except Exception as e:
+                lines.append("FAIL " + label + "  ->  " + str(e).splitlines()[0][:200])
+    out = "\n".join(lines)
+    print(out)
+    Path(__file__).with_name("probe_output.txt").write_text(out + "\n")
+
+
 def cmd_place(args):
     if args.live and os.environ.get("WEBULL_ALLOW_LIVE") != "1":
         sys.exit("Refusing --live without WEBULL_ALLOW_LIVE=1. Finish the graduation checks first.")
@@ -160,12 +184,13 @@ def main():
     p.add_argument("--live", action="store_true", help="use production host (also needs WEBULL_ALLOW_LIVE=1)")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("accounts", help="list accounts to get account_id")
+    sub.add_parser("probe", help="find which key format + host your keys work with (read-only)")
     pl = sub.add_parser("place", help="send open paper trades from an app export")
     pl.add_argument("export", help="JSON file from Bot tab -> Export")
     pl.add_argument("--account", help="Webull account_id")
     pl.add_argument("--send", action="store_true", help="actually send (default is dry run)")
     args = p.parse_args()
-    {"accounts": cmd_accounts, "place": cmd_place}[args.cmd](args)
+    {"accounts": cmd_accounts, "place": cmd_place, "probe": cmd_probe}[args.cmd](args)
 
 
 if __name__ == "__main__":
