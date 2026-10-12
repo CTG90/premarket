@@ -1,5 +1,9 @@
 # Premarket Pro
 
+Two pages, same site, shared paper history:
+- **trade.html — Make Me Trade.** One screen for trading: what to do now, signals, bot, track record. 10 tickers only (SPY QQQ NVDA AAPL AMZN MSFT META TSLA AMD PLTR). Refreshes every 3 min in market hours, keep-awake toggle for phones, browser alerts on every bot trade.
+- **index.html — Research.** Full dashboard: news, macro, earnings, holdings, swings, congress trades, crowd.
+
 Single-file options and stock trading dashboard with a paper-trading bot. No build step, no backend. Open `index.html` in a browser, or host it on GitHub Pages.
 
 Live URL: https://ctg90.github.io/premarket/

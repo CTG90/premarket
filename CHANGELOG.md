@@ -1,5 +1,13 @@
 # Changelog
 
+## Make Me Trade — Oct 12 2026
+- New trade.html: single-screen trading app on 10 liquid tickers (~12 requests per refresh vs ~70).
+- "What to do now" card driven by session phase (premarket / opening range / open / closing / closed).
+- Signal status per ticker shows exactly why the bot will or won't take it (score, blocked, regime, earnings, cost, max positions).
+- Keep-awake (Wake Lock) so phones don't pause the bot; browser notifications on bot opens/closes.
+- Shares bot engine and paper history with the research app; cross-links between the two.
+- Webull sandbox relay in relay/ (dry-run default, hard caps).
+
 ## v3 — Oct 11 2026
 - New Bot tab: paper-trading engine that trades the app's signals, with take-profit/stop/time/earnings exits, rules editor, stats by setup/score/trend/vol, self-adjusting rules, graduation checklist, export/import.
 - Order layer: every trade is a broker-neutral order; Ticket view renders TOS line, Webull line, OCC symbol, Schwab API body.
