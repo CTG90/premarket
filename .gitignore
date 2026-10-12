@@ -5,3 +5,10 @@ relay/accounts_output.txt
 *.key
 .webull_paper
 relay/__pycache__/
+relay/bot_state.json
+relay/bars_cache.json
+relay/status.html
+relay/bot.log
+relay/*_output.txt
+relay/*.log
+STOP

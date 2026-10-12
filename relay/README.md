@@ -19,6 +19,16 @@ fake money.
 - Keys + account id live in `MakeMeTrade/.webull_paper` (gitignored, chmod 600) on the Mac.
 - Mac scripts: `setup.command` (one-time), `probe.command` (read-only connection check). Run with `bash ~/AI/MakeMeTrade/<name>.command`.
 
+## Mac bot (mmt_bot.py)
+Runs the Make Me Trade playbook against Webull paper with Webull's own quotes, daily bars and option bid/ask/IV.
+- Start: `bash ~/AI/MakeMeTrade/start-bot.command` (keeps the Mac awake, opens relay/status.html)
+- Rules: relay/bot_config.json (created on first run). Hard cap 1 contract.
+- Pause new entries: create a file named `STOP` in MakeMeTrade. Exits keep being managed.
+- Order checks: limit DAY orders at mid + 1/4 spread; skips spreads > 12% of mid, open interest < 50, cost > $750.
+- Unfilled orders are cancelled after ~7 minutes.
+- Earnings guard not available yet (no earnings feed in Webull data API).
+- Format check without placing: `bash ~/AI/MakeMeTrade/testorder.command`
+
 ## Setup (once)
 1. Apply at webull.com → avatar → **Developer Tool** → OpenAPI Management → My Application.
    The **sandbox** application auto-approves in minutes; production takes 1–2 business days.
