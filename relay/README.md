@@ -19,6 +19,13 @@ fake money.
 - Keys + account id live in `MakeMeTrade/.webull_paper` (gitignored, chmod 600) on the Mac.
 - Mac scripts: `setup.command` (one-time), `probe.command` (read-only connection check). Run with `bash ~/AI/MakeMeTrade/<name>.command`.
 
+## Strategy (Oct 12 2026 backtest)
+- Buying calls/puts on momentum: lost money (current rules ~41% win, -$14/trade); best-looking buy settings failed on the newer half of the data.
+- **Live strategy: SPY/QQQ credit spreads** — trend-following bull put / bear call, $5 wide, ~0.30 delta short, 45 DTE, take profit at 75% of credit, exit at 7 DTE, RSI ≤ 70 for puts, new entry weekly, up to 4 open per ticker.
+  Backtest (Oct 2023–Oct 2026, modeled prices): 182 trades, 84.6% win, +$59/spread, worst -$367, max drawdown -$2,026; older half 86% / newer half 83%.
+- Caveats: no 2022-style crash in sample (Webull gives 1,000 days), modeled option prices, 2026 weaker (69%).
+- Webull API: vertical spreads go through order_v3 with option_strategy VERTICAL, side SELL + positive credit (confirmed by preview).
+
 ## Mac bot (mmt_bot.py)
 Runs the Make Me Trade playbook against Webull paper with Webull's own quotes, daily bars and option bid/ask/IV.
 - Start: `bash ~/AI/MakeMeTrade/start-bot.command` (keeps the Mac awake, opens relay/status.html)

@@ -43,7 +43,18 @@ NAMES = {"SPY": "S&P 500 ETF", "QQQ": "Nasdaq ETF", "NVDA": "Nvidia", "AAPL": "A
          "MSFT": "Microsoft", "META": "Meta", "TSLA": "Tesla", "AMD": "AMD", "PLTR": "Palantir"}
 
 DEFAULTS = {
-    "mode": "watch",           # watch = signals only, no orders · buy = buy calls/puts (paper)
+    "mode": "spreads",         # spreads = SPY/QQQ credit spreads (backtest winner) · buy = buy calls/puts · watch = no orders
+    "spread_tickers": ["SPY", "QQQ"],
+    "spread_delta": 0.30,      # short strike delta
+    "spread_dte": 45,          # days to expiry at entry
+    "spread_width": 5,         # $ between strikes
+    "spread_tp_pct": 75,       # close when 75% of the credit is captured
+    "spread_exit_dte": 7,      # otherwise close with 7 days left
+    "spread_ladder": 4,        # max open spreads per ticker
+    "spread_spacing_days": 7,  # at most one new spread per ticker per week
+    "spread_max_rsi": 70,      # skip bull puts when RSI is above this
+    "spread_both_sides": True, # bear call spreads in downtrends
+    "spread_min_credit": 0.40,
     "contracts": 1,            # contracts per trade (hard cap below)
     "max_per_trade": 750,      # $ per trade
     "max_open": 5,
@@ -181,6 +192,18 @@ class WB:
 
     def place(self, order):
         return self._call(self.tc.order_v2.place_option, self.acct, [order])
+
+    def preview3(self, order):
+        return self._call(self.tc.order_v3.preview_order, self.acct, [order])
+
+    def place3(self, order):
+        return self._call(self.tc.order_v3.place_order, self.acct, [order])
+
+    def detail3(self, coid):
+        return self._call(self.tc.order_v3.get_order_detail, self.acct, coid)
+
+    def cancel3(self, coid):
+        return self._call(self.tc.order_v3.cancel_order, self.acct, coid)
 
     def detail(self, coid):
         return self._call(self.tc.order_v2.get_order_detail, self.acct, coid)
@@ -395,12 +418,18 @@ def deep(obj, keys):
 # ── stats / learning / graduation ─────────────────────────────────────
 def pnl(t):
     px = t["exit"]["px"] if t.get("exit") else (t.get("mark") or {}).get("px", t["entry"]["px"])
+    if t.get("kind") == "spread":   # entry = credit received, px = debit to close
+        return (t["entry"]["px"] - px) * 100 * t["qty"]
     return (px - t["entry"]["px"]) * 100 * t["qty"]
 
 
 def pnl_pct(t):
     px = t["exit"]["px"] if t.get("exit") else (t.get("mark") or {}).get("px", t["entry"]["px"])
-    return (px / t["entry"]["px"] - 1) * 100 if t["entry"]["px"] else 0
+    if not t["entry"]["px"]:
+        return 0
+    if t.get("kind") == "spread":   # % of credit captured
+        return (t["entry"]["px"] - px) / t["entry"]["px"] * 100
+    return (px / t["entry"]["px"] - 1) * 100
 
 
 def stats(ts):
@@ -424,6 +453,8 @@ def learned(st, cfg):
             out["blocked"].append(k); out["notes"].append("Blocked %s: %d trades, avg $%.0f" % (k, s["n"], s["exp"]))
     bands = {}
     for t in closed:
+        if t.get("score") is None:
+            continue
         bands.setdefault(int(t["score"] // 10 * 10), []).append(t)
     for b, ts in bands.items():
         s = stats(ts)
@@ -456,7 +487,7 @@ class Bot:
         self.cfg = load_cfg()
         self.st = load_json(STATE_F, None) or {"trades": [], "log": [], "exp_field": None, "created": time.time()}
         self.quotes, self.ind, self.sigs, self.regime = {}, {}, [], {"k": "unknown", "why": []}
-        self.last_tick = None; self.err = None
+        self.last_tick = None; self.err = None; self.spread_sigs = []
 
     # data
     def refresh_bars(self):
@@ -495,8 +526,8 @@ class Bot:
         return {"k": k, "why": why or ["SPY above 50/200-day, volatility normal"]}
 
     # helpers
-    def open_trades(self):
-        return [t for t in self.st["trades"] if t["status"] in ("opening", "open", "closing")]
+    def open_trades(self, spreads=True):
+        return [t for t in self.st["trades"] if t["status"] in ("opening", "open", "closing") and (spreads or t.get("kind") != "spread")]
 
     def today_entries(self):
         d = now_et().date().isoformat()
@@ -540,14 +571,19 @@ class Bot:
                 po = t.get(kind)
                 if not po or po.get("done"):
                     continue
-                code, body = self.wb.detail(po["coid"])
+                if t.get("kind") == "spread":
+                    code, body = self.wb.detail3(po["coid"])
+                    if code != 200:
+                        code, body = self.wb.detail(po["coid"])
+                else:
+                    code, body = self.wb.detail(po["coid"])
                 status = str(deep(body, ["status", "order_status"]) or "").upper()
                 fpx = f(deep(body, ["filled_price", "avg_filled_price", "filled_avg_price", "avg_price", "fill_price"]))
                 po["last_status"] = status
                 age = time.time() - po["at"]
                 if "FILL" in status and "PART" not in status:
                     po["done"] = True
-                    px = fpx or po["limit"]
+                    px = abs(fpx) if fpx else po["limit"]
                     if kind == "open_order":
                         t["entry"]["px"] = px; t["status"] = "open"; t["peak"] = px
                         say("✅ FILLED open %s @ $%.2f" % (t["occ"], px), self.st)
@@ -561,13 +597,16 @@ class Bot:
                     else:
                         t["status"] = "open"; t.pop("close_order", None); say("Close order %s ended: %s — will retry" % (t["occ"], status), self.st)
                 elif age > 7 * 60:
-                    self.wb.cancel(po["coid"])
+                    if t.get("kind") == "spread":
+                        c1, _ = self.wb.cancel3(po["coid"])
+                    else:
+                        c1, _ = self.wb.cancel(po["coid"])
                     say("Cancel stale %s order %s (%s, %.0f min)" % ("open" if kind == "open_order" else "close", t["occ"], status or "?", age / 60), self.st)
 
     # exits
     def manage_exits(self, opts, trading):
         cfg = self.cfg
-        for t in [x for x in self.st["trades"] if x["status"] == "open"]:
+        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") != "spread"]:
             q = opts.get(t["occ"])
             if q:
                 bid, ask, mid = opt_px(q)
@@ -651,7 +690,7 @@ class Bot:
         for r in rows:
             if r["k"] != "go":
                 continue
-            if len(self.open_trades()) >= cfg["max_open"]:
+            if len(self.open_trades(spreads=False)) >= cfg["max_open"]:
                 r["label"] = "Max positions"; break
             if len(self.today_entries()) >= cfg["max_orders_per_day"]:
                 r["label"] = "Daily order cap"; break
@@ -674,6 +713,165 @@ class Bot:
             elif self.dry:
                 r["label"] = "DRY: would buy %s @ $%.2f" % (c["occ"], limit)
 
+    # ── credit spreads ────────────────────────────────────────────────
+    def spread_order(self, t, opening, limit):
+        """Vertical spread via order_v3. Opening = sell credit; closing = buy back for a debit."""
+        def leg(side, k):
+            return {"side": side, "quantity": str(t["qty"]), "symbol": t["ticker"], "strike_price": "%g" % k,
+                    "option_expire_date": t["exp"], "instrument_type": "OPTION",
+                    "option_type": "PUT" if t["right"] == "P" else "CALL", "market": "US"}
+        if opening:
+            legs = [leg("SELL", t["short_k"]), leg("BUY", t["long_k"])]
+        else:
+            legs = [leg("BUY", t["short_k"]), leg("SELL", t["long_k"])]
+        return {"client_order_id": uuid.uuid4().hex, "combo_type": "NORMAL", "option_strategy": "VERTICAL",
+                "order_type": "LIMIT", "side": legs[0]["side"], "time_in_force": "DAY", "entrust_type": "QTY",
+                "instrument_type": "OPTION", "market": "US", "symbol": t["ticker"], "quantity": str(t["qty"]),
+                "limit_price": "%.2f" % limit, "legs": legs}
+
+    def send_spread(self, order, label):
+        code, body = self.wb.preview3(order)
+        if code != 200:
+            say("Spread preview FAILED %s: %s %s" % (label, code, str(body)[:220]), self.st)
+            return None
+        if self.dry:
+            say("DRY spread preview ok: %s" % label, self.st)
+            return None
+        code, body = self.wb.place3(order)
+        if code != 200:
+            say("Spread place FAILED %s: %s %s" % (label, code, str(body)[:220]), self.st)
+            return None
+        return order["client_order_id"]
+
+    def spread_quote(self, t, snaps=None):
+        occs = [t["short_occ"], t["long_occ"]]
+        snaps = snaps or self.wb.option_snapshots(occs)
+        sq, lq = snaps.get(occs[0]), snaps.get(occs[1])
+        if not (sq and lq):
+            return None
+        sb, sa, sm = opt_px(sq); lb, la, lm = opt_px(lq)
+        return {"mid": sm - lm, "natural_credit": sb - la, "natural_debit": sa - lb, "short_delta": f(sq.get("delta")), "iv": f(sq.get("imp_vol"))}
+
+    def manage_spreads(self, trading):
+        cfg = self.cfg
+        opn = [t for t in self.st["trades"] if t.get("kind") == "spread" and t["status"] == "open"]
+        if not opn:
+            return
+        snaps = self.wb.option_snapshots([o for t in opn for o in (t["short_occ"], t["long_occ"])])
+        for t in opn:
+            q = self.spread_quote(t, snaps)
+            if q:
+                t["mark"] = {"px": max(0.0, q["mid"]), "at": time.time(), "delta": q["short_delta"]}
+            if not trading or not q:
+                continue
+            captured = pnl_pct(t)
+            d = dte(t["exp"])
+            reason = None
+            if captured >= cfg["spread_tp_pct"]:
+                reason = "Take profit %d%% of credit" % cfg["spread_tp_pct"]
+            elif d <= cfg["spread_exit_dte"]:
+                reason = "Time exit (%d DTE)" % math.ceil(d)
+            if not reason:
+                continue
+            limit = max(0.01, round(q["mid"] + (q["natural_debit"] - q["mid"]) * 0.25, 2))
+            coid = self.send_spread(self.spread_order(t, False, limit), "close " + t["occ"])
+            if coid:
+                t["close_order"] = {"coid": coid, "at": time.time(), "limit": limit, "reason": reason}
+                t["status"] = "closing"
+                say("📤 CLOSE %s for $%.2f debit · %s" % (t["occ"], limit, reason), self.st)
+
+    def spread_entries(self, window):
+        cfg = self.cfg
+        rows = []
+        for tk in cfg["spread_tickers"]:
+            m, ind = self.quotes.get(tk), self.ind.get(tk)
+            row = {"t": tk, "label": "", "k": "none", "m": m}
+            rows.append(row)
+            if not (m and ind):
+                row["label"] = "waiting for data"; continue
+            tr = trend_of(ind, m["price"])
+            row["trend"] = tr
+            if tr == "up":
+                right = "P"
+            elif tr == "down" and cfg["spread_both_sides"]:
+                right = "C"
+            else:
+                row["label"] = "No trend (%s) — sit out" % tr; continue
+            if right == "P" and ind["rsi"] is not None and ind["rsi"] > cfg["spread_max_rsi"]:
+                row["label"] = "RSI %d > %d — wait" % (ind["rsi"], cfg["spread_max_rsi"]); continue
+            mine = [t for t in self.st["trades"] if t.get("kind") == "spread" and t["ticker"] == tk and t["status"] in ("opening", "open", "closing")]
+            if len(mine) >= cfg["spread_ladder"]:
+                row["label"] = "Ladder full (%d open)" % len(mine); continue
+            recent = [t for t in self.st["trades"] if t.get("kind") == "spread" and t["ticker"] == tk and t["status"] != "cancelled"
+                      and time.time() - t["created"] < cfg["spread_spacing_days"] * 86400]
+            if recent:
+                row["label"] = "Next entry after %s" % dt.datetime.fromtimestamp(recent[-1]["created"] + cfg["spread_spacing_days"] * 86400, ET).strftime("%a %b %d")
+                continue
+            row["k"] = "go"; row["label"] = ("Bull put" if right == "P" else "Bear call") + " · ready"
+            if not window or cfg.get("mode") != "spreads" or STOP_F.exists():
+                if cfg.get("mode") == "spreads" and not STOP_F.exists():
+                    row["label"] += " (enters 9:45–3:45)"
+                continue
+            if self.realized_today() <= -cfg["daily_loss_limit"] or len(self.today_entries()) >= cfg["max_orders_per_day"]:
+                row["label"] = "Daily limit reached"; continue
+            c, why = self.pick_spread(tk, m["price"], right)
+            if not c:
+                row["label"] = "Skip: " + why; continue
+            limit = round(c["mid"] - (c["mid"] - c["natural_credit"]) * 0.25, 2)
+            limit = max(limit, round(c["natural_credit"], 2))
+            t = {"id": uuid.uuid4().hex[:10], "kind": "spread", "ticker": tk, "right": right, "dir": right,
+                 "short_k": c["short_k"], "long_k": c["long_k"], "exp": c["exp"], "short_occ": c["short_occ"], "long_occ": c["long_occ"],
+                 "occ": "%s %g/%g%s %s" % (tk, c["short_k"], c["long_k"], right, c["exp"][5:]), "strike": c["short_k"],
+                 "qty": 1, "play": "Bull put" if right == "P" else "Bear call", "score": None,
+                 "feat": {"trend": tr, "rsi": round(ind["rsi"]) if ind["rsi"] else None, "vr": ind["vr"], "delta": c["delta"]},
+                 "created": time.time(), "entry": {"px": limit, "und": m["price"], "at": time.time(), "iv": c["iv"]},
+                 "max_loss": (cfg["spread_width"] - limit) * 100, "status": "opening"}
+            coid = self.send_spread(self.spread_order(t, True, limit), "open " + t["occ"])
+            if coid:
+                t["open_order"] = {"coid": coid, "at": time.time(), "limit": limit}
+                self.st["trades"].append(t)
+                row["label"] = "Order sent"; row["k"] = "held"
+                say("📥 SELL %s for $%.2f credit · short Δ %.2f · max loss $%.0f" % (t["occ"], limit, c["delta"] or 0, t["max_loss"]), self.st)
+        self.spread_sigs = rows
+
+    def pick_spread(self, tk, S, right):
+        cfg = self.cfg; w = cfg["spread_width"]
+        iso = friday_at_least(cfg["spread_dte"])
+        # rough strike for target delta, then scan ±6 strikes for the real delta from Webull
+        ind = self.ind.get(tk) or {}
+        sig = max(0.12, (ind.get("hv") or 15) / 100 * 1.15); T = max(dte(iso), 1) / 365
+        z = 0.5244  # N^-1(0.70) ~ 0.30 delta
+        k_est = S * math.exp(-(z * sig * math.sqrt(T)) + (0.04 + sig * sig / 2) * T * 0) if right == "P" else S * math.exp(z * sig * math.sqrt(T))
+        base = round(k_est)
+        cands = [base + i for i in range(-6, 7)]
+        occs = [occ(tk, iso, right, k) for k in cands]
+        snaps = self.wb.option_snapshots(occs)
+        best = None
+        for k, o in zip(cands, occs):
+            q = snaps.get(o)
+            dlt = f((q or {}).get("delta"))
+            if dlt is None:
+                continue
+            gap = abs(abs(dlt) - cfg["spread_delta"])
+            if best is None or gap < best[0]:
+                best = (gap, k, o, q)
+        if not best:
+            return None, "no option quotes for %s" % iso
+        _, short_k, short_occ, sq = best
+        long_k = short_k - w if right == "P" else short_k + w
+        long_occ = occ(tk, iso, right, long_k)
+        lq = snaps.get(long_occ) or self.wb.option_snapshots([long_occ]).get(long_occ)
+        if not lq:
+            return None, "no quote for long leg %g" % long_k
+        sb, sa, sm = opt_px(sq); lb, la, lm = opt_px(lq)
+        mid = sm - lm; nat = sb - la
+        if mid < cfg["spread_min_credit"]:
+            return None, "credit $%.2f < $%.2f min" % (mid, cfg["spread_min_credit"])
+        if (w - mid) * 100 > cfg["max_per_trade"]:
+            return None, "max loss $%.0f > $%d" % ((w - mid) * 100, cfg["max_per_trade"])
+        return {"short_k": short_k, "long_k": long_k, "exp": iso, "short_occ": short_occ, "long_occ": long_occ,
+                "mid": mid, "natural_credit": nat, "delta": f(sq.get("delta")), "iv": f(sq.get("imp_vol"))}, None
+
     def tick(self):
         n = now_et(); mins = n.hour * 60 + n.minute; wd = n.weekday() < 5
         market = wd and 570 <= mins < 960
@@ -687,9 +885,12 @@ class Bot:
             if market and not fresh:
                 say("Quotes look stale (holiday/halt?) — no trading this cycle", self.st)
             self.check_pending()
-            opts = self.wb.option_snapshots([t["occ"] for t in self.st["trades"] if t["status"] in ("open", "closing")]) if self.open_trades() else {}
+            singles = [t["occ"] for t in self.st["trades"] if t["status"] in ("open", "closing") and t.get("kind") != "spread"]
+            opts = self.wb.option_snapshots(singles) if singles else {}
             self.manage_exits(opts, market and fresh)
+            self.manage_spreads(market and fresh)
             self.entries(window and fresh)
+            self.spread_entries(window and fresh)
             self.err = None
         except Exception as e:
             self.err = "%s: %s" % (type(e).__name__, str(e).splitlines()[0][:200] if str(e) else "")
@@ -697,7 +898,10 @@ class Bot:
             traceback.print_exc()
         self.last_tick = time.time()
         save_json(STATE_F, self.st)
-        write_html(self)
+        try:
+            write_html(self)
+        except Exception as e:
+            say("Dashboard error (bot still running): %s" % e, self.st)
 
     def sleep_s(self):
         n = now_et(); mins = n.hour * 60 + n.minute; wd = n.weekday() < 5
@@ -736,8 +940,12 @@ def write_html(bot):
         h.append("<div class='c' style='border-color:#ef4444;color:#f87171'>⏸ STOP file present — no new entries. Delete MakeMeTrade/STOP to resume.</div>")
     if bot.dry:
         h.append("<div class='c' style='border-color:#f59e0b;color:#fbbf24'>DRY RUN — previews only, no orders placed.</div>")
-    if cfg.get("mode", "watch") != "buy":
-        h.append("<div class='c' style='border-color:#818cf8;color:#c7d2fe'>👀 WATCH MODE — showing signals only, no new orders. (Backtest said the current buy rules lose; switching strategy after testing.) Open positions are still managed.</div>")
+    mode = cfg.get("mode", "watch")
+    if mode == "spreads":
+        h.append("<div class='c' style='border-color:#16a34a;color:#86efac'>📐 SPREADS MODE — SPY/QQQ credit spreads, $%g wide, ~%.2f delta, %d DTE, take profit at %d%% of credit, exit at %d DTE. Buying calls/puts is off.</div>" % (
+            cfg["spread_width"], cfg["spread_delta"], cfg["spread_dte"], cfg["spread_tp_pct"], cfg["spread_exit_dte"]))
+    elif mode != "buy":
+        h.append("<div class='c' style='border-color:#818cf8;color:#c7d2fe'>👀 WATCH MODE — signals only, no new orders. Open positions are still managed.</div>")
     if bot.err:
         h.append("<div class='c' style='border-color:#ef4444;color:#f87171'>Last error: %s</div>" % esc(bot.err))
     h.append("<div class='c k'><div><div class=l>Regime</div><div class=v style='color:%s'>%s</div></div>" % (regc, reg["k"].upper()))
@@ -752,11 +960,18 @@ def write_html(bot):
         h.append("<table><tr><th>Contract</th><th>Status</th><th>Entry</th><th>Mark</th><th>P&amp;L</th></tr>")
         for t in opn:
             mk = (t.get("mark") or {}).get("px")
-            h.append("<tr><td><b>%s</b><div class=m>%s · score %d · %d DTE</div></td><td>%s</td><td>$%.2f</td><td>%s</td><td class=%s>%+.0f%%<div class=m>%+.0f$</div></td></tr>" % (
-                esc(t["occ"]), esc(t["play"]), t["score"], max(0, dte(t["exp"])), t["status"], t["entry"]["px"],
+            info = ("score %d" % t["score"]) if t.get("score") is not None else ("credit $%.2f · max loss $%.0f" % (t["entry"]["px"], t.get("max_loss", 0)))
+            h.append("<tr><td><b>%s</b><div class=m>%s · %s · %d DTE</div></td><td>%s</td><td>$%.2f</td><td>%s</td><td class=%s>%+.0f%%<div class=m>%+.0f$</div></td></tr>" % (
+                esc(t["occ"]), esc(t["play"]), info, max(0, dte(t["exp"])), t["status"], t["entry"]["px"],
                 "$%.2f" % mk if mk else "--", "up" if pnl(t) >= 0 else "dn", pnl_pct(t), pnl(t)))
         h.append("</table>")
-    h.append("</div><h2>Signals</h2><div class=c><table><tr><th>Ticker</th><th>Price</th><th>Score</th><th>Play</th><th>Status</th></tr>")
+    h.append("</div><h2>Spread signals</h2><div class=c><table><tr><th>Ticker</th><th>Price</th><th>Trend</th><th>Status</th></tr>")
+    for r in bot.spread_sigs:
+        m = r.get("m")
+        h.append("<tr><td><b>%s</b></td><td>%s</td><td>%s</td><td><span class='chip %s'>%s</span></td></tr>" % (
+            r["t"], ("$%.2f <span class=%s>%+.2f%%</span>" % (m["price"], "up" if m["pct"] >= 0 else "dn", m["pct"])) if m else "--",
+            r.get("trend", "--"), "g" if r["k"] in ("go", "held") else "", esc(r["label"])))
+    h.append("</table></div><h2>Momentum signals (info only%s)</h2><div class=c><table><tr><th>Ticker</th><th>Price</th><th>Score</th><th>Play</th><th>Status</th></tr>" % ("" if mode == "buy" else " · buying is off"))
     for r in bot.sigs:
         m = r["m"]
         h.append("<tr><td><b>%s</b></td><td>$%.2f <span class=%s>%+.2f%%</span></td><td>%d</td><td>%s<div class=m>%s</div></td><td><span class='chip %s'>%s</span></td></tr>" % (
@@ -844,6 +1059,10 @@ def test_spread():
         print("v3 preview [%s] -> %s %s" % (name, code, json.dumps(body, default=str)[:500]))
         if code == 200:
             print("✅ Multi-leg spread orders are supported. Working format:", name)
+            close = dict(order); close["client_order_id"] = uuid.uuid4().hex; close["side"] = "BUY"
+            close["legs"] = [leg("BUY", short_k), leg("SELL", long_k)]; close["limit_price"] = "%.2f" % max(0.05, round(credit * 0.3, 2))
+            c2, b2 = bot.wb._call(bot.wb.tc.order_v3.preview_order, bot.wb.acct, [close])
+            print("v3 preview [close: BUY short back, SELL long, debit] -> %s %s" % (c2, json.dumps(b2, default=str)[:400]))
             break
 
 
