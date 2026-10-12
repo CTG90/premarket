@@ -44,17 +44,22 @@ NAMES = {"SPY": "S&P 500 ETF", "QQQ": "Nasdaq ETF", "NVDA": "Nvidia", "AAPL": "A
 
 DEFAULTS = {
     "mode": "spreads",         # spreads = SPY/QQQ credit spreads (backtest winner) · buy = buy calls/puts · watch = no orders
+    "account_size": 2500,      # the paper bot trades as if this were the whole account
+    "risk_per_trade_pct": 6,   # max loss per spread as % of account
+    "max_total_risk_pct": 30,  # max loss across all open spreads as % of account
+    "scale_every": 2500,       # +1 contract per spread for every $2,500 of account equity
+    "spread_max_contracts": 10,
     "spread_tickers": ["SPY", "QQQ"],
     "spread_delta": 0.30,      # short strike delta
     "spread_dte": 45,          # days to expiry at entry
-    "spread_width": 5,         # $ between strikes
+    "spread_width": 2,         # $ between strikes (small-account test winner)
     "spread_tp_pct": 75,       # close when 75% of the credit is captured
     "spread_exit_dte": 7,      # otherwise close with 7 days left
-    "spread_ladder": 4,        # max open spreads per ticker
+    "spread_ladder": 2,        # max open spreads per ticker
     "spread_spacing_days": 7,  # at most one new spread per ticker per week
     "spread_max_rsi": 70,      # skip bull puts when RSI is above this
     "spread_both_sides": True, # bear call spreads in downtrends
-    "spread_min_credit": 0.40,
+    "spread_min_credit_pct": 20,  # credit must be ≥ 20% of width
     "contracts": 1,            # contracts per trade (hard cap below)
     "max_per_trade": 750,      # $ per trade
     "max_open": 5,
@@ -67,7 +72,7 @@ DEFAULTS = {
     "max_spread_pct": 12,      # skip contracts whose bid/ask spread is wider than this % of mid
     "min_open_interest": 50,
     "max_orders_per_day": 5,   # new entries per day
-    "daily_loss_limit": 1500,  # stop new entries for the day after this much realized loss
+    "daily_loss_limit": 250,   # stop new entries for the day after this much realized loss
     "pause_calls_risk_off": True,
     "learn": True,
 }
@@ -713,6 +718,18 @@ class Bot:
             elif self.dry:
                 r["label"] = "DRY: would buy %s @ $%.2f" % (c["occ"], limit)
 
+    # ── account sim ───────────────────────────────────────────────────
+    def equity(self):
+        realized = sum(pnl(t) for t in self.st["trades"] if t.get("kind") == "spread" and t["status"] == "closed")
+        return self.cfg["account_size"] + realized
+
+    def open_risk(self):
+        return sum(t.get("max_loss", 0) for t in self.st["trades"] if t.get("kind") == "spread" and t["status"] in ("opening", "open", "closing"))
+
+    def spread_qty(self):
+        cfg = self.cfg
+        return max(1, min(cfg["spread_max_contracts"], int(self.equity() // cfg["scale_every"])))
+
     # ── credit spreads ────────────────────────────────────────────────
     def spread_order(self, t, opening, limit):
         """Vertical spread via order_v3. Opening = sell credit; closing = buy back for a debit."""
@@ -822,16 +839,16 @@ class Bot:
             t = {"id": uuid.uuid4().hex[:10], "kind": "spread", "ticker": tk, "right": right, "dir": right,
                  "short_k": c["short_k"], "long_k": c["long_k"], "exp": c["exp"], "short_occ": c["short_occ"], "long_occ": c["long_occ"],
                  "occ": "%s %g/%g%s %s" % (tk, c["short_k"], c["long_k"], right, c["exp"][5:]), "strike": c["short_k"],
-                 "qty": 1, "play": "Bull put" if right == "P" else "Bear call", "score": None,
+                 "qty": c["qty"], "play": "Bull put" if right == "P" else "Bear call", "score": None,
                  "feat": {"trend": tr, "rsi": round(ind["rsi"]) if ind["rsi"] else None, "vr": ind["vr"], "delta": c["delta"]},
                  "created": time.time(), "entry": {"px": limit, "und": m["price"], "at": time.time(), "iv": c["iv"]},
-                 "max_loss": (cfg["spread_width"] - limit) * 100, "status": "opening"}
+                 "max_loss": (cfg["spread_width"] - limit) * 100 * c["qty"], "status": "opening"}
             coid = self.send_spread(self.spread_order(t, True, limit), "open " + t["occ"])
             if coid:
                 t["open_order"] = {"coid": coid, "at": time.time(), "limit": limit}
                 self.st["trades"].append(t)
                 row["label"] = "Order sent"; row["k"] = "held"
-                say("📥 SELL %s for $%.2f credit · short Δ %.2f · max loss $%.0f" % (t["occ"], limit, c["delta"] or 0, t["max_loss"]), self.st)
+                say("📥 SELL %dx %s for $%.2f credit · short Δ %.2f · max loss $%.0f · account $%.0f" % (t["qty"], t["occ"], limit, c["delta"] or 0, t["max_loss"], self.equity()), self.st)
         self.spread_sigs = rows
 
     def pick_spread(self, tk, S, right):
@@ -865,12 +882,16 @@ class Bot:
             return None, "no quote for long leg %g" % long_k
         sb, sa, sm = opt_px(sq); lb, la, lm = opt_px(lq)
         mid = sm - lm; nat = sb - la
-        if mid < cfg["spread_min_credit"]:
-            return None, "credit $%.2f < $%.2f min" % (mid, cfg["spread_min_credit"])
-        if (w - mid) * 100 > cfg["max_per_trade"]:
-            return None, "max loss $%.0f > $%d" % ((w - mid) * 100, cfg["max_per_trade"])
+        if mid < w * cfg["spread_min_credit_pct"] / 100:
+            return None, "credit $%.2f < %d%% of $%g width" % (mid, cfg["spread_min_credit_pct"], w)
+        qty = self.spread_qty(); eq = self.equity()
+        loss = (w - mid) * 100 * qty
+        if loss > eq * cfg["risk_per_trade_pct"] / 100:
+            return None, "max loss $%.0f > %d%% of $%.0f" % (loss, cfg["risk_per_trade_pct"], eq)
+        if self.open_risk() + loss > eq * cfg["max_total_risk_pct"] / 100:
+            return None, "would put >%d%% of account at risk" % cfg["max_total_risk_pct"]
         return {"short_k": short_k, "long_k": long_k, "exp": iso, "short_occ": short_occ, "long_occ": long_occ,
-                "mid": mid, "natural_credit": nat, "delta": f(sq.get("delta")), "iv": f(sq.get("imp_vol"))}, None
+                "mid": mid, "natural_credit": nat, "delta": f(sq.get("delta")), "iv": f(sq.get("imp_vol")), "qty": qty}, None
 
     def tick(self):
         n = now_et(); mins = n.hour * 60 + n.minute; wd = n.weekday() < 5
@@ -948,10 +969,12 @@ def write_html(bot):
         h.append("<div class='c' style='border-color:#818cf8;color:#c7d2fe'>👀 WATCH MODE — signals only, no new orders. Open positions are still managed.</div>")
     if bot.err:
         h.append("<div class='c' style='border-color:#ef4444;color:#f87171'>Last error: %s</div>" % esc(bot.err))
-    h.append("<div class='c k'><div><div class=l>Regime</div><div class=v style='color:%s'>%s</div></div>" % (regc, reg["k"].upper()))
+    eq = bot.equity()
+    h.append("<div class='c k'><div><div class=l>Account (sim)</div><div class='v %s'>$%s</div></div>" % ("up" if eq >= cfg["account_size"] else "dn", format(round(eq), ",")))
+    h.append("<div><div class=l>At risk now</div><div class=v>$%.0f</div><div class=m>%.0f%% · %dx size</div></div>" % (bot.open_risk(), bot.open_risk() / eq * 100 if eq else 0, bot.spread_qty()))
     h.append("<div><div class=l>Total P&amp;L</div><div class='v %s'>%+.0f$</div></div>" % ("up" if total >= 0 else "dn", total))
-    h.append("<div><div class=l>Win rate</div><div class=v>%s</div></div>" % ("%.0f%%" % s["wr"] if s["n"] else "--"))
-    h.append("<div><div class=l>Closed / Open</div><div class=v>%d / %d</div></div></div>" % (s["n"], len(opn)))
+    h.append("<div><div class=l>Win rate</div><div class=v>%s</div><div class=m>%d closed · %d open</div></div></div>" % ("%.0f%%" % s["wr"] if s["n"] else "--", s["n"], len(opn)))
+    h.append("<div class=m>Regime: <b style='color:%s'>%s</b></div>" % (regc, reg["k"].upper()))
     h.append("<div class=m>%s</div>" % esc(" · ".join(reg["why"])))
     h.append("<h2>Open positions</h2><div class=c>")
     if not opn:
@@ -978,7 +1001,7 @@ def write_html(bot):
             r["t"], m["price"], "up" if m["pct"] >= 0 else "dn", m["pct"], r["sc"]["s"], r["sc"]["play"], esc(", ".join(r["sc"]["sigs"][:4])),
             "g" if r["k"] in ("go", "held") else "r" if r["k"] == "blk" else "", esc(r["label"])))
     h.append("</table></div><h2>Ready for real money?</h2><div class=c><table>")
-    for name, ok, v in graduation(st):
+    for name, ok, v in graduation(st, cfg["account_size"]):
         h.append("<tr><td>%s %s</td><td>%s</td></tr>" % ("✅" if ok else "❌", name, v))
     h.append("</table><div class=m style='margin-top:6px'>%s</div></div>" % esc(" · ".join(L["notes"])))
     h.append("<h2>Closed trades</h2><div class=c>")

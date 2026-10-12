@@ -26,6 +26,12 @@ fake money.
 - Caveats: no 2022-style crash in sample (Webull gives 1,000 days), modeled option prices, 2026 weaker (69%).
 - Webull API: vertical spreads go through order_v3 with option_strategy VERTICAL, side SELL + positive credit (confirmed by preview).
 
+## $2,500 account plan (Oct 12 2026 small-account test)
+- Bot simulates a $2,500 account (paper Webull shows $1M; the bot sizes from account_size + realized P&L).
+- $2-wide SPY/QQQ credit spreads, ~0.30Δ, 45 DTE, TP 75%, max 2 open per ticker, ≤6% risk/trade, ≤30% total, daily loss stop $250.
+- Test: 114 trades, 86% win, +$23/trade, ~$920/yr (~37%), max DD 12%; older half 93%/$34, newer half 79%/$12.
+- Scaling: +1 contract per spread for each $2,500 of equity (cap 10).
+
 ## Mac bot (mmt_bot.py)
 Runs the Make Me Trade playbook against Webull paper with Webull's own quotes, daily bars and option bid/ask/IV.
 - Start: `bash ~/AI/MakeMeTrade/start-bot.command` (keeps the Mac awake, opens relay/status.html)
