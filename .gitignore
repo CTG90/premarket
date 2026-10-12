@@ -1,3 +1,5 @@
 relay/sent.json
+relay/.venv/
+relay/accounts_output.txt
 .env
 *.key
