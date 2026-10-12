@@ -791,7 +791,7 @@ def test_order():
         sys.exit("No usable SPY contract: " + why)
     t = {"ticker": "SPY", "dir": "C", "strike": c["strike"], "exp": c["exp"], "qty": 1}
     print("Contract:", c["occ"], "bid", c["bid"], "ask", c["ask"], "spread %.1f%%" % c["spread"], "OI", c["oi"], "IV", c["iv"])
-    base = build_order(t, "BUY", round(c["bid"] * 0.5, 2) or 0.05, "option_expire_date")
+    base = build_order(t, "BUY", 1, max(0.05, round(c["bid"] * 0.5, 2)), "option_expire_date")
     for fld in ("option_expire_date", "init_exp_date"):
         o = json.loads(json.dumps(base)); leg = o["legs"][0]
         if fld != "option_expire_date":
