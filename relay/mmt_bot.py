@@ -43,6 +43,7 @@ NAMES = {"SPY": "S&P 500 ETF", "QQQ": "Nasdaq ETF", "NVDA": "Nvidia", "AAPL": "A
          "MSFT": "Microsoft", "META": "Meta", "TSLA": "Tesla", "AMD": "AMD", "PLTR": "Palantir"}
 
 DEFAULTS = {
+    "mode": "watch",           # watch = signals only, no orders · buy = buy calls/puts (paper)
     "contracts": 1,            # contracts per trade (hard cap below)
     "max_per_trade": 750,      # $ per trade
     "max_open": 5,
@@ -641,6 +642,8 @@ class Bot:
         self.sigs = rows
         if not trading_window:
             return
+        if cfg.get("mode", "watch") != "buy":
+            return
         if STOP_F.exists():
             return
         if self.realized_today() <= -cfg["daily_loss_limit"]:
@@ -733,6 +736,8 @@ def write_html(bot):
         h.append("<div class='c' style='border-color:#ef4444;color:#f87171'>⏸ STOP file present — no new entries. Delete MakeMeTrade/STOP to resume.</div>")
     if bot.dry:
         h.append("<div class='c' style='border-color:#f59e0b;color:#fbbf24'>DRY RUN — previews only, no orders placed.</div>")
+    if cfg.get("mode", "watch") != "buy":
+        h.append("<div class='c' style='border-color:#818cf8;color:#c7d2fe'>👀 WATCH MODE — showing signals only, no new orders. (Backtest said the current buy rules lose; switching strategy after testing.) Open positions are still managed.</div>")
     if bot.err:
         h.append("<div class='c' style='border-color:#ef4444;color:#f87171'>Last error: %s</div>" % esc(bot.err))
     h.append("<div class='c k'><div><div class=l>Regime</div><div class=v style='color:%s'>%s</div></div>" % (regc, reg["k"].upper()))
@@ -805,14 +810,54 @@ def test_order():
     save_json(STATE_F, bot.st)
 
 
+def test_spread():
+    """Preview (never place) a SPY bull put spread via order_v3 to confirm multi-leg support."""
+    bot = Bot(dry=True)
+    bot.refresh_quotes()
+    m = bot.quotes.get("SPY")
+    if not m:
+        sys.exit("No SPY quote.")
+    S = m["price"]; iso = friday_at_least(40)
+    short_k = round_strike(S * 0.96); long_k = short_k - 5
+    occs = [occ("SPY", iso, "P", short_k), occ("SPY", iso, "P", long_k)]
+    q = bot.wb.option_snapshots(occs)
+    for o in occs:
+        b, a, mid = opt_px(q.get(o, {}))
+        print("%s bid %.2f ask %.2f delta %s" % (o, b, a, (q.get(o) or {}).get("delta")))
+    sb, sa, smid = opt_px(q.get(occs[0], {})); lb, la, lmid = opt_px(q.get(occs[1], {}))
+    credit = round(max(0.05, smid - lmid), 2)
+    print("Bull put spread SPY %s %g/%g · est credit $%.2f · max risk $%.0f" % (iso, short_k, long_k, credit, (5 - credit) * 100))
+    def leg(side, k):
+        return {"side": side, "quantity": "1", "symbol": "SPY", "strike_price": "%g" % k, "option_expire_date": iso,
+                "instrument_type": "OPTION", "option_type": "PUT", "market": "US"}
+    variants = [
+        ("SELL short first, side SELL, +credit", [leg("SELL", short_k), leg("BUY", long_k)], "SELL", credit),
+        ("BUY long first, side BUY, -credit", [leg("BUY", long_k), leg("SELL", short_k)], "BUY", -credit),
+        ("BUY long first, side BUY, +credit", [leg("BUY", long_k), leg("SELL", short_k)], "BUY", credit),
+    ]
+    for name, legs, side, px in variants:
+        order = {"client_order_id": uuid.uuid4().hex, "combo_type": "NORMAL", "option_strategy": "VERTICAL",
+                 "order_type": "LIMIT", "side": side, "time_in_force": "DAY", "entrust_type": "QTY",
+                 "instrument_type": "OPTION", "market": "US", "symbol": "SPY", "quantity": "1",
+                 "limit_price": "%.2f" % px, "legs": legs}
+        code, body = bot.wb._call(bot.wb.tc.order_v3.preview_order, bot.wb.acct, [order])
+        print("v3 preview [%s] -> %s %s" % (name, code, json.dumps(body, default=str)[:500]))
+        if code == 200:
+            print("✅ Multi-leg spread orders are supported. Working format:", name)
+            break
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--test-order", action="store_true")
+    ap.add_argument("--test-spread", action="store_true")
     a = ap.parse_args()
     if a.test_order:
         return test_order()
+    if a.test_spread:
+        return test_spread()
     bot = Bot(dry=a.dry)
     say("Make Me Trade bot started · host %s · %s" % (bot.wb.host, "DRY RUN" if a.dry else "paper orders"), bot.st)
     say("Dashboard: %s" % HTML_F)
