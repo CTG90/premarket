@@ -12,3 +12,6 @@ relay/bot.log
 relay/*_output.txt
 relay/*.log
 STOP
+relay/bt_bars.json
+relay/backtest_*.txt
+relay/backtest_results.json
