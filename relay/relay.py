@@ -27,7 +27,8 @@ import sys
 import uuid
 from pathlib import Path
 
-SANDBOX_HOST = "us-openapi-alb.uat.webullbroker.com"
+SANDBOX_HOST = "api.sandbox.webull.com"        # current docs (paper/sandbox)
+OLD_UAT_HOST = "us-openapi-alb.uat.webullbroker.com"
 LIVE_HOST = "api.webull.com"
 REGION = "us"
 
@@ -124,7 +125,7 @@ def cmd_probe(args):
     keys = [key] + ([key.split(".", 1)[1]] if key.lower().startswith("us.") else [])
     lines = []
     for k in keys:
-        for h in (SANDBOX_HOST, LIVE_HOST):
+        for h in (SANDBOX_HOST, OLD_UAT_HOST, LIVE_HOST):
             label = f'key={"as-is" if k == key else "without us."}  host={h}'
             try:
                 tc, _ = client(False, k, secret, h)
