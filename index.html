@@ -365,23 +365,30 @@ function quoteOf(t){return movers.find(function(m){return m.ticker===t})||null}
 function lsGet(k,d){try{var v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}}
 function lsSet(k,v){try{localStorage.setItem(k,JSON.stringify(v));return true}catch(e){return false}}
 
-// ── NETWORK: direct, then CORS proxies; remembers what worked ────
-var ROUTE=lsGet('pp_route',0);
-function routes(url){return[url,'https://corsproxy.io/?'+encodeURIComponent(url),'https://api.allorigins.win/raw?url='+encodeURIComponent(url)]}
+// ── NETWORK ───────────────────────────────────────────────────────
+// Yahoo sends no CORS headers, so a page on github.io can't call it
+// directly. Race both public CORS proxies; first good answer wins.
+var PROXIES=[function(u){return'https://corsproxy.io/?'+encodeURIComponent(u)},function(u){return'https://api.allorigins.win/raw?url='+encodeURIComponent(u)}];
+var NET={ok:0,fail:0,last:0};
 function tmo(ms){try{return AbortSignal.timeout(ms)}catch(e){var c=new AbortController();setTimeout(function(){c.abort()},ms);return c.signal}}
-async function fetchText(url,timeout){
-  var rs=routes(url),order=[ROUTE].concat([0,1,2].filter(function(i){return i!==ROUTE}));
-  for(var k=0;k<order.length;k++){
-    try{
-      var r=await fetch(rs[order[k]],{signal:tmo(timeout||8000)});
-      if(!r.ok) continue;
-      var txt=await r.text();
-      if(!txt) continue;
-      if(order[k]!==ROUTE){ROUTE=order[k];lsSet('pp_route',ROUTE)}
-      return txt;
-    }catch(e){continue}
-  }
-  return null;
+function fetchText(url,timeout){
+  var t0=Date.now();
+  return new Promise(function(resolve){
+    var left=PROXIES.length,done=false,ctrls=[];
+    function fin(){if(--left===0&&!done){done=true;NET.fail++;resolve(null)}}
+    PROXIES.forEach(function(p){
+      var c=new AbortController();ctrls.push(c);
+      var timer=setTimeout(function(){try{c.abort()}catch(e){}},timeout||7000);
+      fetch(p(url),{signal:c.signal}).then(function(r){return r.ok?r.text():null}).then(function(txt){
+        clearTimeout(timer);
+        if(!done&&txt&&!/^\s*<(!doctype html|html)/i.test(txt)){
+          done=true;NET.ok++;NET.last=Date.now()-t0;
+          ctrls.forEach(function(x){if(x!==c){try{x.abort()}catch(e){}}});
+          resolve(txt);
+        }else fin();
+      }).catch(function(){clearTimeout(timer);fin()});
+    });
+  });
 }
 async function fetchJSON(url,timeout){
   var t=await fetchText(url,timeout);
@@ -397,37 +404,54 @@ async function pool(items,n,fn){
 }
 
 // ── QUOTES ────────────────────────────────────────────────────────
+// v7 (has earnings + premarket) needs a Yahoo login crumb and usually
+// fails now. Try it once per day; if it fails, go straight to v8.
 function r2(x){return Math.round(x*100)/100}
+var V7_OFF=lsGet('pp_v7off','')===etDateStr();
+function etDayOf(ts){return new Date(ts*1000).toLocaleDateString('en-CA',{timeZone:'America/New_York'})}
 async function fetchQ(ticker){
-  var sym=encodeURIComponent(ysym(ticker));
-  var wm=wlOf(ticker);
-  var d=await fetchJSON('https://query1.finance.yahoo.com/v7/finance/quote?symbols='+sym);
-  if(d&&d.quoteResponse&&d.quoteResponse.result&&d.quoteResponse.result[0]){
-    var q=d.quoteResponse.result[0];
-    var price=q.regularMarketPrice,prev=q.regularMarketPreviousClose||price;
-    if(price){
-      var o={ticker:ticker,name:(wm?wm.n:null)||q.shortName||q.longName||ticker,
-        price:r2(price),pct:r2(q.regularMarketChangePercent||0),change:r2(q.regularMarketChange||0),prev:r2(prev),
-        high:q.regularMarketDayHigh||null,low:q.regularMarketDayLow||null,
-        vol:q.regularMarketVolume||null,avgVol:q.averageDailyVolume3Month||q.averageDailyVolume10Day||null,
-        hi52:q.fiftyTwoWeekHigh||null,lo52:q.fiftyTwoWeekLow||null,
-        earnTs:q.earningsTimestamp||q.earningsTimestampStart||null};
-      var st=q.marketState||'';
-      if(q.preMarketPrice&&(st==='PRE'||st==='PREPRE')){o.pmPrice=q.preMarketPrice;o.pmPct=q.preMarketChangePercent||((q.preMarketPrice-price)/price*100);o.isPremarket=true}
-      else if(q.postMarketPrice&&(st==='POST'||st==='POSTPOST'||st==='CLOSED')){o.pmPrice=q.postMarketPrice;o.pmPct=q.postMarketChangePercent||((q.postMarketPrice-price)/price*100);o.isPremarket=false}
-      return o;
-    }
+  if(!V7_OFF){
+    var q7=await fetchQ7(ticker);
+    if(q7) return q7;
+    V7_OFF=true;lsSet('pp_v7off',etDateStr());
   }
-  d=await fetchJSON('https://query1.finance.yahoo.com/v8/finance/chart/'+sym+'?interval=1d&range=5d');
-  if(d&&d.chart&&d.chart.result&&d.chart.result[0]){
-    var m=d.chart.result[0].meta,p=m.regularMarketPrice||m.previousClose,pv=m.previousClose||m.chartPreviousClose||p;
-    if(!p) return null;
-    return{ticker:ticker,name:(wm?wm.n:null)||m.shortName||ticker,price:r2(p),pct:r2((p-pv)/pv*100),change:r2(p-pv),prev:r2(pv),
-      high:m.regularMarketDayHigh||null,low:m.regularMarketDayLow||null,vol:m.regularMarketVolume||null,avgVol:null,
-      hi52:m.fiftyTwoWeekHigh||null,lo52:m.fiftyTwoWeekLow||null,earnTs:null};
-  }
-  return null;
+  return fetchQ8(ticker);
 }
+async function fetchQ7(ticker){
+  var wm=wlOf(ticker);
+  var d=await fetchJSON('https://query1.finance.yahoo.com/v7/finance/quote?symbols='+encodeURIComponent(ysym(ticker)),6000);
+  if(!(d&&d.quoteResponse&&d.quoteResponse.result&&d.quoteResponse.result[0])) return null;
+  var q=d.quoteResponse.result[0];
+  var price=q.regularMarketPrice,prev=q.regularMarketPreviousClose||price;
+  if(!price) return null;
+  var o={ticker:ticker,name:(wm?wm.n:null)||q.shortName||q.longName||ticker,
+    price:r2(price),pct:r2(q.regularMarketChangePercent||0),change:r2(q.regularMarketChange||0),prev:r2(prev),
+    high:q.regularMarketDayHigh||null,low:q.regularMarketDayLow||null,
+    vol:q.regularMarketVolume||null,avgVol:q.averageDailyVolume3Month||q.averageDailyVolume10Day||null,
+    hi52:q.fiftyTwoWeekHigh||null,lo52:q.fiftyTwoWeekLow||null,
+    earnTs:q.earningsTimestamp||q.earningsTimestampStart||null};
+  var st=q.marketState||'';
+  if(q.preMarketPrice&&(st==='PRE'||st==='PREPRE')){o.pmPrice=q.preMarketPrice;o.pmPct=q.preMarketChangePercent||((q.preMarketPrice-price)/price*100);o.isPremarket=true}
+  else if(q.postMarketPrice&&(st==='POST'||st==='POSTPOST'||st==='CLOSED')){o.pmPrice=q.postMarketPrice;o.pmPct=q.postMarketChangePercent||((q.postMarketPrice-price)/price*100);o.isPremarket=false}
+  return o;
+}
+async function fetchQ8(ticker){
+  var wm=wlOf(ticker);
+  var d=await fetchJSON('https://query1.finance.yahoo.com/v8/finance/chart/'+encodeURIComponent(ysym(ticker))+'?interval=1d&range=5d',7000);
+  var r=d&&d.chart&&d.chart.result&&d.chart.result[0];
+  if(!r) return null;
+  var m=r.meta||{},q=(r.indicators&&r.indicators.quote&&r.indicators.quote[0])||{},ts=r.timestamp||[];
+  var cl=[],vo=[];
+  for(var i=0;i<ts.length;i++){if(q.close&&q.close[i]!=null){cl.push(q.close[i]);vo.push(q.volume?q.volume[i]||0:0)}}
+  var p=m.regularMarketPrice||cl[cl.length-1];
+  if(!p) return null;
+  var pv=cl.length>=2?cl[cl.length-2]:(m.previousClose||m.chartPreviousClose||p);
+  var ind=IND[ticker];
+  return{ticker:ticker,name:(wm?wm.n:null)||m.shortName||ticker,price:r2(p),pct:r2((p-pv)/pv*100),change:r2(p-pv),prev:r2(pv),
+    high:m.regularMarketDayHigh||null,low:m.regularMarketDayLow||null,vol:vo.length?vo[vo.length-1]:(m.regularMarketVolume||null),
+    avgVol:ind?ind.avgVol:null,hi52:m.fiftyTwoWeekHigh||null,lo52:m.fiftyTwoWeekLow||null,earnTs:null};
+}
+function fillAvgVol(){movers.forEach(function(m){if(!m.avgVol&&IND[m.ticker])m.avgVol=IND[m.ticker].avgVol})}
 
 // ── DAILY HISTORY (cached once per ET day) ───────────────────────
 function etNow(){return new Date(new Date().toLocaleString('en-US',{timeZone:'America/New_York'}))}
@@ -508,7 +532,8 @@ function computeInd(H){
   var hi52=Math.max.apply(null,h.slice(-252)),lo52=Math.min.apply(null,l.slice(-252));
   return{last:last,sma20:sma(c,20),sma50:sma(c,50),sma200:sma(c,200),rsi:rsi(c,14),atr:atr(h,l,c,14),
     hv:hv,hvRank:hvRank,hi52:hi52,lo52:lo52,levels:lv,
-    ret20:n>20?(last/c[n-21]-1)*100:null,closes:c.slice(-60)};
+    ret20:n>20?(last/c[n-21]-1)*100:null,closes:c.slice(-60),
+    avgVol:(function(v){v=v.slice(-64,-1);return v.length?v.reduce(function(a,b){return a+b},0)/v.length:null})(H.v||[])};
 }
 async function loadInd(t){
   var H=await fetchHist(t);
@@ -1038,27 +1063,30 @@ async function go(){
   var btn=document.getElementById('rb');btn.classList.add('spinning');
   var res=[],done=0,first=movers.length===0;
   setStat('Loading quotes…','scl');
-  await pool(ALL_T,4,async function(t){
+  var vixP=Promise.all([fetchQ8('^VIX'),fetchQ8('^VIX3M')]);
+  await pool(ALL_T,6,async function(t){
     var q=await fetchQ(t);done++;
     if(first) setLoad('Fetching quotes… '+done+'/'+ALL_T.length);
     if(q&&q.price>0) res.push(q);
   });
-  var vq=await fetchQ('^VIX'),v3=await fetchQ('^VIX3M');
-  VIX=vq?vq.price:null;VIX3M=v3?v3.price:null;
+  var vv=await vixP;
+  if(vv[0]) VIX=vv[0].price;
+  if(vv[1]) VIX3M=vv[1].price;
   if(VIX!=null){var sv=document.getElementById('sVix');sv.textContent=VIX.toFixed(1);sv.style.color=VIX>25?'#ef4444':VIX>18?'#f59e0b':'#10b981'}
   if(!res.length){
     btn.classList.remove('spinning');BUSY=false;
-    document.getElementById('mc').innerHTML='<div class="es"><div class="ei">⚠️</div><div class="et">No data loaded</div><div class="em">Yahoo or the CORS proxies are blocking right now.<br>Try again in a minute. Open the app from<br><strong>https://ctg90.github.io/premarket/</strong></div></div>';
+    document.getElementById('mc').innerHTML='<div class="es"><div class="ei">⚠️</div><div class="et">No data loaded</div><div class="em">Both CORS proxies failed. Try again in a minute.</div></div>';
     setStat('No quotes loaded — proxies may be rate-limiting','ser');
     renderTab(CUR_TAB);
     return;
   }
   res.sort(function(a,b){return Math.abs(b.pct)-Math.abs(a.pct)});
-  movers=res;
-  // daily history for watchlist + holdings (cached once per day)
-  setStat('Computing levels from daily history…','scl');
+  movers=res;fillAvgVol();
+  render();renderTab(CUR_TAB);
+  setStat('Quotes in · computing levels from daily history…','scl');
   var need=WL.map(function(w){return w.t}).concat(EXTRA);
-  await pool(need,4,loadInd);
+  await pool(need,5,loadInd);
+  fillAvgVol();
   btn.classList.remove('spinning');
   var acted=botTick();
   var open=mktOpen();

@@ -1,5 +1,14 @@
 # Changelog
 
+## Speed fix — Oct 12 2026
+- Yahoo v7 quote endpoint needs a login crumb and was failing on every call; app tried it 3x per ticker before falling back. Now tried once per day, then skipped.
+- Dropped the direct-to-Yahoo attempt (always blocked by CORS from github.io).
+- Both CORS proxies are raced in parallel; fastest answer wins.
+- Prices render as they arrive; history loads after, VIX fetched in parallel.
+- Steady-state refresh: ~24 requests in one parallel wave vs ~48 sequential attempts.
+- Avg volume now computed from cached daily history (v8 doesn't return it).
+- Make Me Trade warns when earnings dates are unavailable (earnings guard can't work).
+
 ## Make Me Trade — Oct 12 2026
 - New trade.html: single-screen trading app on 10 liquid tickers (~12 requests per refresh vs ~70).
 - "What to do now" card driven by session phase (premarket / opening range / open / closing / closed).
