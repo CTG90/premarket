@@ -165,21 +165,27 @@ class WB:
                     out[q["symbol"]] = q
         return out
 
+    def _call(self, fn, *a):
+        """SDK raises on non-200; turn that into (status, message) so the bot can log and carry on."""
+        try:
+            res = fn(*a)
+            return res.status_code, self.body(res)
+        except Exception as e:
+            msg = str(e).splitlines()[0] if str(e) else type(e).__name__
+            code = getattr(e, "http_status", None) or getattr(e, "status", None) or 0
+            return code, {"error": msg[:400], "type": type(e).__name__}
+
     def preview(self, order):
-        res = self.tc.order_v2.preview_option(self.acct, [order])
-        return res.status_code, self.body(res)
+        return self._call(self.tc.order_v2.preview_option, self.acct, [order])
 
     def place(self, order):
-        res = self.tc.order_v2.place_option(self.acct, [order])
-        return res.status_code, self.body(res)
+        return self._call(self.tc.order_v2.place_option, self.acct, [order])
 
     def detail(self, coid):
-        res = self.tc.order_v2.get_order_detail(self.acct, coid)
-        return res.status_code, self.body(res)
+        return self._call(self.tc.order_v2.get_order_detail, self.acct, coid)
 
     def cancel(self, coid):
-        res = self.tc.order_v2.cancel_option(self.acct, coid)
-        return res.status_code, self.body(res)
+        return self._call(self.tc.order_v2.cancel_option, self.acct, coid)
 
 
 # ── indicators (same math as the browser app) ─────────────────────────
@@ -785,8 +791,16 @@ def test_order():
         sys.exit("No usable SPY contract: " + why)
     t = {"ticker": "SPY", "dir": "C", "strike": c["strike"], "exp": c["exp"], "qty": 1}
     print("Contract:", c["occ"], "bid", c["bid"], "ask", c["ask"], "spread %.1f%%" % c["spread"], "OI", c["oi"], "IV", c["iv"])
-    coid, body = bot.send(build_order(t, "BUY", 0.01, "option_expire_date"), "test " + c["occ"])
-    print("Preview result:", json.dumps(body, default=str)[:800])
+    base = build_order(t, "BUY", round(c["bid"] * 0.5, 2) or 0.05, "option_expire_date")
+    for fld in ("option_expire_date", "init_exp_date"):
+        o = json.loads(json.dumps(base)); leg = o["legs"][0]
+        if fld != "option_expire_date":
+            leg[fld] = leg.pop("option_expire_date")
+        code, body = bot.wb.preview(o)
+        print("Preview with %s -> %s %s" % (fld, code, json.dumps(body, default=str)[:600]))
+        if code == 200:
+            bot.st["exp_field"] = fld
+            break
     print("Expiry field that worked:", bot.st.get("exp_field"))
     save_json(STATE_F, bot.st)
 
