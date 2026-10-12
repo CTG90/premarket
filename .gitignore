@@ -4,3 +4,4 @@ relay/accounts_output.txt
 .env
 *.key
 .webull_paper
+relay/__pycache__/
