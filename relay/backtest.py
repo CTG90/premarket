@@ -220,7 +220,7 @@ def run_credit(data, cache, p):
                     out = (pnl, reason); break
             if not out:
                 break
-            trades.append({"t": t, "d": P["t"][i], "pnl": out[0] * 100, "risk": max_loss * 100, "why": out[1], "days": j - i})
+            trades.append({"t": t, "d": P["t"][i], "pnl": out[0] * 100 - p.get("fee", 0.26), "risk": max_loss * 100, "why": out[1], "days": j - i})
             open_exits.append(j); last_entry = i
     return trades
 
@@ -255,6 +255,7 @@ def by_year(trades):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cached", action="store_true")
+    ap.add_argument("--small", type=float, default=0, help="account size: test narrow spreads sized for it")
     a = ap.parse_args()
     data_raw = json.loads(BARS_F.read_text()) if (a.cached and BARS_F.exists()) else fetch_bars()
     if not data_raw:
@@ -274,6 +275,8 @@ def main():
             # use indicators from the prior day for avg volume comparisons, current close for price
             cache[t][i] = (ind, M.score(m, ind))
 
+    if a.small:
+        return small_account(data, cache, a.small)
     all_dates = sorted({P["t"][i] for P in data.values() for i in range(260, P["n"])})
     split = all_dates[len(all_dates) // 2]
     yrs = max(0.5, (dt.date.fromisoformat(all_dates[-1]) - dt.date.fromisoformat(all_dates[0])).days / 365)
@@ -336,6 +339,54 @@ def main():
     print("\n" + rep)
     (BASE / "backtest_report.txt").write_text(rep + "\n")
     (BASE / "backtest_results.json").write_text(json.dumps({"span": span, "current": cur, "picks": picks, "buy_picks": buy_picks}, default=str))
+
+
+def small_account(data, cache, acct):
+    """Narrow SPY/QQQ credit spreads sized for a small account. Simulates the account balance."""
+    rows = []
+    grid = [dict(delta=d, dte=dte, width_pct=0, width_usd=w, tp=tp, stop_mult=0, exit_dte=7, both_sides=True,
+                 etf_only=True, max_rsi=70, ladder=ld, spacing=5, max_risk=0, fee=0.26)
+            for d, dte, w, tp, ld in itertools.product([0.20, 0.25, 0.30], [30, 45], [1, 2, 3, 5], [50, 75], [1, 2])]
+    for p in grid:
+        tr = sorted(run_credit(data, cache, p), key=lambda x: x["d"])
+        s = summarize(tr)
+        if not s or s["n"] < 30:
+            continue
+        # account sim: open positions overlap; approximate peak capital at risk by max concurrent risk
+        bal = acct; peak = acct; dd = 0
+        for x in tr:
+            bal += x["pnl"]; peak = max(peak, bal); dd = max(dd, (peak - bal) / peak * 100)
+        span_days = (dt.date.fromisoformat(tr[-1]["d"]) - dt.date.fromisoformat(tr[0]["d"])).days or 1
+        per_yr = s["total"] / span_days * 365
+        max_concurrent = 2 * p["ladder"]
+        worst_case = max_concurrent * s["avg_risk"]
+        half = len(tr) // 2
+        a1, a2 = summarize(tr[:half]), summarize(tr[half:])
+        rows.append({"p": p, "s": s, "per_yr": per_yr, "pct_yr": per_yr / acct * 100, "dd_pct": dd,
+                     "risk_pct": s["avg_risk"] / acct * 100, "worst_case_pct": worst_case / acct * 100,
+                     "older": a1, "newer": a2})
+    ok = [r for r in rows if r["risk_pct"] <= 6 and r["worst_case_pct"] <= 30 and r["s"]["exp"] > 0
+          and r["older"] and r["newer"] and r["older"]["exp"] > 0 and r["newer"]["exp"] > 0]
+    ok.sort(key=lambda r: -r["per_yr"])
+    L = ["SMALL ACCOUNT TEST · $%.0f · SPY/QQQ credit spreads, fee $0.26/spread round trip" % acct,
+         "Configs: %d · fit risk rules (≤6%% per trade, ≤30%% all open) and profitable in BOTH halves: %d" % (len(rows), len(ok))]
+    for r in ok[:12]:
+        s, p = r["s"], r["p"]
+        L.append("width $%d Δ%.2f %dDTE tp%d%% ladder%d | n=%d win=%.0f%% exp=$%.1f/trade | $%.0f/yr (%.0f%%/yr) | risk/trade %.1f%% · all-open %.0f%% · maxDD %.1f%% | older %.0f%%/$%.1f newer %.0f%%/$%.1f" % (
+            p["width_usd"], p["delta"], p["dte"], p["tp"], p["ladder"], s["n"], s["wr"], s["exp"], r["per_yr"], r["pct_yr"],
+            r["risk_pct"], r["worst_case_pct"], r["dd_pct"], r["older"]["wr"], r["older"]["exp"], r["newer"]["wr"], r["newer"]["exp"]))
+    if not ok:
+        L.append("(nothing fits the risk rules and stays profitable)")
+    L.append("\nAll widths for reference (best per width by $/yr):")
+    for w in (1, 2, 3, 5):
+        ws = sorted([r for r in rows if r["p"]["width_usd"] == w], key=lambda r: -r["per_yr"])[:2]
+        for r in ws:
+            L.append("  $%d: win=%.0f%% exp=$%.1f $/yr=%.0f risk/trade=%.1f%% older $%.1f newer $%.1f" % (
+                w, r["s"]["wr"], r["s"]["exp"], r["per_yr"], r["risk_pct"], r["older"]["exp"] if r["older"] else 0, r["newer"]["exp"] if r["newer"] else 0))
+    rep = "\n".join(L)
+    print(rep)
+    (BASE / "small_account_report.txt").write_text(rep + "\n")
+    (BASE / "small_account_results.json").write_text(json.dumps(ok[:12], default=str))
 
 
 if __name__ == "__main__":

@@ -15,3 +15,4 @@ STOP
 relay/bt_bars.json
 relay/backtest_*.txt
 relay/backtest_results.json
+relay/small_account_*
