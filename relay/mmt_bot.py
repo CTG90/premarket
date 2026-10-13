@@ -52,10 +52,10 @@ DEFAULTS = {
     "scale_every": 2500,       # +1 contract per spread for every $2,500 of account equity
     "spread_max_contracts": 10,
     "pullback_enabled": True,     # uptrend + RSI(2) dip → call debit spread (cheap version of a pullback call)
-    "pullback_rsi2": 10,
+    "pullback_rsi2": 5,           # backtest: RSI2<5 beat <10 on both halves of the data
     "pullback_dte": 45,
-    "pullback_tp_pct": 30,        # close at +30% on the debit
-    "pullback_max_hold_days": 14, # calendar days
+    "pullback_tp_pct": 50,        # close at +50% on the debit (best in debittest, Oct 13)
+    "pullback_max_hold_days": 21, # calendar days
     "pullback_risk_pct": 5,       # max debit per trade as % of account
     "pullback_max_open": 3,
     "iv_log": True,               # log ATM implied vol + expected moves daily (for future vol-timing tests)
