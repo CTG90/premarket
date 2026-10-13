@@ -16,3 +16,4 @@ relay/bt_bars.json
 relay/backtest_*.txt
 relay/backtest_results.json
 relay/small_account_*
+relay/swing_report.txt
