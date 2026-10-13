@@ -39,6 +39,8 @@ STOP_F = ROOT / "STOP"
 ET = ZoneInfo("America/New_York")
 
 WATCH = ["SPY", "QQQ", "NVDA", "AAPL", "AMZN", "MSFT", "META", "TSLA", "AMD", "PLTR"]
+UNIVERSE = WATCH + ["GOOGL", "NFLX", "AVGO"]
+IV_LOG = Path(__file__).resolve().parent / "iv_log.csv"
 NAMES = {"SPY": "S&P 500 ETF", "QQQ": "Nasdaq ETF", "NVDA": "Nvidia", "AAPL": "Apple", "AMZN": "Amazon",
          "MSFT": "Microsoft", "META": "Meta", "TSLA": "Tesla", "AMD": "AMD", "PLTR": "Palantir"}
 
@@ -49,6 +51,14 @@ DEFAULTS = {
     "max_total_risk_pct": 30,  # max loss across all open spreads as % of account
     "scale_every": 2500,       # +1 contract per spread for every $2,500 of account equity
     "spread_max_contracts": 10,
+    "pullback_enabled": True,     # uptrend + RSI(2) dip → call debit spread (cheap version of a pullback call)
+    "pullback_rsi2": 10,
+    "pullback_dte": 45,
+    "pullback_tp_pct": 30,        # close at +30% on the debit
+    "pullback_max_hold_days": 14, # calendar days
+    "pullback_risk_pct": 5,       # max debit per trade as % of account
+    "pullback_max_open": 3,
+    "iv_log": True,               # log ATM implied vol + expected moves daily (for future vol-timing tests)
     "spread_tickers": ["SPY", "QQQ"],
     "spread_delta": 0.30,      # short strike delta
     "spread_dte": 45,          # days to expiry at entry
@@ -492,14 +502,14 @@ class Bot:
         self.cfg = load_cfg()
         self.st = load_json(STATE_F, None) or {"trades": [], "log": [], "exp_field": None, "created": time.time()}
         self.quotes, self.ind, self.sigs, self.regime = {}, {}, [], {"k": "unknown", "why": []}
-        self.last_tick = None; self.err = None; self.spread_sigs = []
+        self.last_tick = None; self.err = None; self.spread_sigs = []; self.pb_sigs = []; self.closes = {}
 
     # data
     def refresh_bars(self):
         cache = load_json(BARS_F, {})
         today = now_et().date().isoformat()
-        if cache.get("d") != today or set(cache.get("bars", {})) < set(WATCH):
-            bars = self.wb.daily_bars(WATCH)
+        if cache.get("d") != today or set(cache.get("bars", {})) < set(UNIVERSE):
+            bars = self.wb.daily_bars(UNIVERSE)
             if bars:
                 cache = {"d": today, "bars": bars}
                 save_json(BARS_F, cache)
@@ -508,9 +518,10 @@ class Bot:
             if B["t"] and B["t"][-1] == today:
                 B = {k: v[:-1] for k, v in B.items()}
             self.ind[t] = indicators(B)
+            self.closes[t] = B["c"]
 
     def refresh_quotes(self):
-        raw = self.wb.snapshot(WATCH)
+        raw = self.wb.snapshot(UNIVERSE)
         q = {}
         for t, r in raw.items():
             p, pc = f(r.get("price")), f(r.get("pre_close"))
@@ -532,7 +543,7 @@ class Bot:
 
     # helpers
     def open_trades(self, spreads=True):
-        return [t for t in self.st["trades"] if t["status"] in ("opening", "open", "closing") and (spreads or t.get("kind") != "spread")]
+        return [t for t in self.st["trades"] if t["status"] in ("opening", "open", "closing") and (spreads or t.get("kind") not in ("spread", "debit"))]
 
     def today_entries(self):
         d = now_et().date().isoformat()
@@ -576,7 +587,7 @@ class Bot:
                 po = t.get(kind)
                 if not po or po.get("done"):
                     continue
-                if t.get("kind") == "spread":
+                if t.get("kind") in ("spread", "debit"):
                     code, body = self.wb.detail3(po["coid"])
                     if code != 200:
                         code, body = self.wb.detail(po["coid"])
@@ -602,7 +613,7 @@ class Bot:
                     else:
                         t["status"] = "open"; t.pop("close_order", None); say("Close order %s ended: %s — will retry" % (t["occ"], status), self.st)
                 elif age > 7 * 60:
-                    if t.get("kind") == "spread":
+                    if t.get("kind") in ("spread", "debit"):
                         c1, _ = self.wb.cancel3(po["coid"])
                     else:
                         c1, _ = self.wb.cancel(po["coid"])
@@ -611,7 +622,7 @@ class Bot:
     # exits
     def manage_exits(self, opts, trading):
         cfg = self.cfg
-        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") != "spread"]:
+        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") not in ("spread", "debit")]:
             q = opts.get(t["occ"])
             if q:
                 bid, ask, mid = opt_px(q)
@@ -720,11 +731,11 @@ class Bot:
 
     # ── account sim ───────────────────────────────────────────────────
     def equity(self):
-        realized = sum(pnl(t) for t in self.st["trades"] if t.get("kind") == "spread" and t["status"] == "closed")
+        realized = sum(pnl(t) for t in self.st["trades"] if t.get("kind") in ("spread", "debit") and t["status"] == "closed")
         return self.cfg["account_size"] + realized
 
     def open_risk(self):
-        return sum(t.get("max_loss", 0) for t in self.st["trades"] if t.get("kind") == "spread" and t["status"] in ("opening", "open", "closing"))
+        return sum(t.get("max_loss", 0) for t in self.st["trades"] if t.get("kind") in ("spread", "debit") and t["status"] in ("opening", "open", "closing"))
 
     def spread_qty(self):
         cfg = self.cfg
@@ -737,7 +748,9 @@ class Bot:
             return {"side": side, "quantity": str(t["qty"]), "symbol": t["ticker"], "strike_price": "%g" % k,
                     "option_expire_date": t["exp"], "instrument_type": "OPTION",
                     "option_type": "PUT" if t["right"] == "P" else "CALL", "market": "US"}
-        if opening:
+        if t.get("kind") == "debit":
+            legs = [leg("BUY", t["long_k"]), leg("SELL", t["short_k"])] if opening else [leg("SELL", t["long_k"]), leg("BUY", t["short_k"])]
+        elif opening:
             legs = [leg("SELL", t["short_k"]), leg("BUY", t["long_k"])]
         else:
             legs = [leg("BUY", t["short_k"]), leg("SELL", t["long_k"])]
@@ -893,6 +906,148 @@ class Bot:
         return {"short_k": short_k, "long_k": long_k, "exp": iso, "short_occ": short_occ, "long_occ": long_occ,
                 "mid": mid, "natural_credit": nat, "delta": f(sq.get("delta")), "iv": f(sq.get("imp_vol")), "qty": qty}, None
 
+    # ── pullback calls (as call debit spreads) ────────────────────────
+    def rsi2_now(self, tk):
+        c = self.closes.get(tk); m = self.quotes.get(tk)
+        if not c or not m:
+            return None
+        return rsi(list(c[-60:]) + [m["price"]], 2)
+
+    def manage_debits(self, trading):
+        cfg = self.cfg
+        opn = [t for t in self.st["trades"] if t.get("kind") == "debit" and t["status"] == "open"]
+        if not opn:
+            return
+        snaps = self.wb.option_snapshots([o for t in opn for o in (t["long_occ"], t["short_occ"])])
+        for t in opn:
+            lq, sq = snaps.get(t["long_occ"]), snaps.get(t["short_occ"])
+            if not (lq and sq):
+                continue
+            lb, la, lm = opt_px(lq); sb, sa, sm = opt_px(sq)
+            mid, nat = lm - sm, lb - sa
+            t["mark"] = {"px": max(0.0, mid), "at": time.time(), "delta": f(lq.get("delta"))}
+            if not trading:
+                continue
+            gain = (mid / t["entry"]["px"] - 1) * 100 if t["entry"]["px"] else 0
+            held = (time.time() - t["entry"]["at"]) / 86400
+            reason = None
+            if gain >= cfg["pullback_tp_pct"]: reason = "Take profit +%d%%" % cfg["pullback_tp_pct"]
+            elif held >= cfg["pullback_max_hold_days"]: reason = "Time exit (%d days)" % held
+            elif dte(t["exp"]) <= 7: reason = "Expiry exit"
+            if not reason:
+                continue
+            limit = max(0.01, round(mid - (mid - nat) * 0.25, 2))
+            coid = self.send_spread(self.spread_order(t, False, limit), "close " + t["occ"])
+            if coid:
+                t["close_order"] = {"coid": coid, "at": time.time(), "limit": limit, "reason": reason}
+                t["status"] = "closing"
+                say("📤 SELL %s for $%.2f · %s" % (t["occ"], limit, reason), self.st)
+
+    def pullback_entries(self, window):
+        cfg = self.cfg; rows = []
+        n = now_et(); late = 915 <= n.hour * 60 + n.minute <= 950   # last ~45 min: today's price ≈ the close the signal uses
+        for tk in UNIVERSE:
+            m, ind = self.quotes.get(tk), self.ind.get(tk)
+            row = {"t": tk, "m": m, "k": "none", "label": ""}
+            rows.append(row)
+            if not (m and ind and ind.get("sma200")):
+                row["label"] = "waiting for data"; continue
+            r2 = self.rsi2_now(tk); row["rsi2"] = r2
+            if m["price"] <= ind["sma200"]:
+                row["label"] = "Below 200-day — skip"; continue
+            if r2 is None or r2 >= cfg["pullback_rsi2"]:
+                row["label"] = "No dip (RSI2 %.0f)" % (r2 or 0); continue
+            if any(t["ticker"] == tk and t.get("kind") == "debit" and t["status"] in ("opening", "open", "closing") for t in self.st["trades"]):
+                row["label"] = "In a position"; row["k"] = "held"; continue
+            row["k"] = "go"; row["label"] = "DIP · RSI2 %.0f" % r2
+            if not (window and late and cfg.get("pullback_enabled") and not STOP_F.exists()):
+                if cfg.get("pullback_enabled"): row["label"] += " (buys 3:15–3:50)"
+                continue
+            if len([t for t in self.st["trades"] if t.get("kind") == "debit" and t["status"] in ("opening", "open", "closing")]) >= cfg["pullback_max_open"]:
+                row["label"] += " · max open"; continue
+            if self.realized_today() <= -cfg["daily_loss_limit"] or len(self.today_entries()) >= cfg["max_orders_per_day"]:
+                row["label"] += " · daily limit"; continue
+            c, why = self.pick_debit(tk, m["price"])
+            if not c:
+                row["label"] += " · skip: " + why; continue
+            limit = round(c["mid"] + (c["natural"] - c["mid"]) * 0.25, 2)
+            t = {"id": uuid.uuid4().hex[:10], "kind": "debit", "ticker": tk, "right": "C", "dir": "C",
+                 "long_k": c["long_k"], "short_k": c["short_k"], "exp": c["exp"], "long_occ": c["long_occ"], "short_occ": c["short_occ"],
+                 "occ": "%s %g/%gC %s" % (tk, c["long_k"], c["short_k"], c["exp"][5:]), "strike": c["long_k"], "qty": c["qty"],
+                 "play": "Pullback call", "score": None, "feat": {"rsi2": round(r2), "trend": "up"},
+                 "created": time.time(), "entry": {"px": limit, "und": m["price"], "at": time.time(), "iv": c["iv"]},
+                 "max_loss": limit * 100 * c["qty"], "status": "opening"}
+            coid = self.send_spread(self.spread_order(t, True, limit), "open " + t["occ"])
+            if coid:
+                t["open_order"] = {"coid": coid, "at": time.time(), "limit": limit}
+                self.st["trades"].append(t); row["k"] = "held"; row["label"] = "Order sent"
+                say("📥 BUY %dx %s for $%.2f debit (pullback, RSI2 %.0f) · max loss $%.0f" % (t["qty"], t["occ"], limit, r2, t["max_loss"]), self.st)
+        self.pb_sigs = rows
+
+    def pick_debit(self, tk, S):
+        cfg = self.cfg; iso = friday_at_least(cfg["pullback_dte"]); step = strike_step(S)
+        long_k = round_strike(S)
+        cap = self.equity() * cfg["pullback_risk_pct"] / 100
+        widths = [step * k for k in (1, 2, 3, 4) if step * k <= S * 0.05] or [step]
+        occs = [occ(tk, iso, "C", long_k)] + [occ(tk, iso, "C", long_k + w) for w in widths]
+        snaps = self.wb.option_snapshots(occs)
+        lq = snaps.get(occs[0])
+        if not lq:
+            return None, "no quote for %g call %s" % (long_k, iso)
+        lb, la, lm = opt_px(lq); best = None
+        for w, o in zip(widths, occs[1:]):
+            sq = snaps.get(o)
+            if not sq:
+                continue
+            sb, sa, sm = opt_px(sq)
+            mid = lm - sm; nat = la - sb
+            if mid <= 0 or mid * 100 > cap:
+                continue
+            if mid > w * 0.7:   # paying >70% of max value = poor reward
+                continue
+            best = {"long_k": long_k, "short_k": long_k + w, "exp": iso, "long_occ": occs[0], "short_occ": o,
+                    "mid": mid, "natural": nat, "iv": f(lq.get("imp_vol")), "qty": 1}
+        if not best:
+            return None, "no spread costs ≤ $%.0f" % cap
+        return best, None
+
+    # ── implied-vol log (one row per ticker per day) ──────────────────
+    def log_iv(self):
+        n = now_et(); today = n.date().isoformat()
+        if not self.cfg.get("iv_log") or self.st.get("iv_logged") == today:
+            return
+        rows = []
+        for tk in UNIVERSE:
+            m = self.quotes.get(tk)
+            if not m:
+                continue
+            S = m["price"]; k = round_strike(S)
+            exps = {"w": friday_at_least(5), "m": friday_at_least(28)}
+            occs = {(lbl, r): occ(tk, iso, r, k) for lbl, iso in exps.items() for r in ("C", "P")}
+            snaps = self.wb.option_snapshots(list(occs.values()))
+            rec = {"date": today, "ticker": tk, "price": round(S, 2), "strike": k}
+            for lbl, iso in exps.items():
+                c, pq = snaps.get(occs[(lbl, "C")]), snaps.get(occs[(lbl, "P")])
+                if c and pq:
+                    _, _, cm = opt_px(c); _, _, pm = opt_px(pq)
+                    rec[lbl + "_exp"] = iso
+                    rec[lbl + "_iv"] = round(((f(c.get("imp_vol"), 0) or 0) + (f(pq.get("imp_vol"), 0) or 0)) / 2, 4)
+                    rec[lbl + "_move_pct"] = round((cm + pm) / S * 100, 2)
+            ind = self.ind.get(tk) or {}
+            rec["hv20"] = round(ind.get("hv") or 0, 2)
+            rows.append(rec)
+        if not rows:
+            return
+        cols = ["date", "ticker", "price", "strike", "hv20", "w_exp", "w_iv", "w_move_pct", "m_exp", "m_iv", "m_move_pct"]
+        new = not IV_LOG.exists()
+        with IV_LOG.open("a") as fh:
+            if new:
+                fh.write(",".join(cols) + "\n")
+            for r in rows:
+                fh.write(",".join(str(r.get(c, "")) for c in cols) + "\n")
+        self.st["iv_logged"] = today
+        say("📒 Logged implied vol for %d tickers" % len(rows), self.st)
+
     def tick(self):
         n = now_et(); mins = n.hour * 60 + n.minute; wd = n.weekday() < 5
         market = wd and 570 <= mins < 960
@@ -906,12 +1061,19 @@ class Bot:
             if market and not fresh:
                 say("Quotes look stale (holiday/halt?) — no trading this cycle", self.st)
             self.check_pending()
-            singles = [t["occ"] for t in self.st["trades"] if t["status"] in ("open", "closing") and t.get("kind") != "spread"]
+            singles = [t["occ"] for t in self.st["trades"] if t["status"] in ("open", "closing") and t.get("kind") not in ("spread", "debit")]
             opts = self.wb.option_snapshots(singles) if singles else {}
             self.manage_exits(opts, market and fresh)
             self.manage_spreads(market and fresh)
+            self.manage_debits(market and fresh)
             self.entries(window and fresh)
             self.spread_entries(window and fresh)
+            self.pullback_entries(window and fresh)
+            if market and fresh and mins >= 930:
+                try:
+                    self.log_iv()
+                except Exception as e:
+                    say("IV log error: %s" % e, self.st)
             self.err = None
         except Exception as e:
             self.err = "%s: %s" % (type(e).__name__, str(e).splitlines()[0][:200] if str(e) else "")
@@ -994,6 +1156,12 @@ def write_html(bot):
         h.append("<tr><td><b>%s</b></td><td>%s</td><td>%s</td><td><span class='chip %s'>%s</span></td></tr>" % (
             r["t"], ("$%.2f <span class=%s>%+.2f%%</span>" % (m["price"], "up" if m["pct"] >= 0 else "dn", m["pct"])) if m else "--",
             r.get("trend", "--"), "g" if r["k"] in ("go", "held") else "", esc(r["label"])))
+    h.append("</table></div><h2>Pullback calls (call debit spreads)</h2><div class=c><table><tr><th>Ticker</th><th>Price</th><th>RSI(2)</th><th>Status</th></tr>")
+    for r in sorted(bot.pb_sigs, key=lambda r: (r["k"] not in ("go", "held"), r["t"])):
+        m = r.get("m")
+        h.append("<tr><td><b>%s</b></td><td>%s</td><td>%s</td><td><span class='chip %s'>%s</span></td></tr>" % (
+            r["t"], ("$%.2f" % m["price"]) if m else "--", ("%.0f" % r["rsi2"]) if r.get("rsi2") is not None else "--",
+            "g" if r["k"] in ("go", "held") else "", esc(r["label"])))
     h.append("</table></div><h2>Momentum signals (info only%s)</h2><div class=c><table><tr><th>Ticker</th><th>Price</th><th>Score</th><th>Play</th><th>Status</th></tr>" % ("" if mode == "buy" else " · buying is off"))
     for r in bot.sigs:
         m = r["m"]

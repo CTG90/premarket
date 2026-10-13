@@ -19,3 +19,5 @@ relay/small_account_*
 relay/swing_report.txt
 relay/edges_report.txt
 relay/edges_winners.json
+relay/iv_log.csv
+relay/debit_report.txt

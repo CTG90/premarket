@@ -174,7 +174,57 @@ def monte_carlo(streams, risk_pct, months=12, runs=10000, seed=7):
             "half": ruined / runs * 100, "wipe": sum(1 for x in finals if x < START * 0.1) / runs * 100}
 
 
+def run_debit(data, p):
+    """S1 pullback signal traded as an ATM call debit spread (what the bot does)."""
+    trades = []
+    for t, P in data.items():
+        busy = -1
+        for i in range(210, P["n"] - 2):
+            if i <= busy or None in (P["s200"][i], P["r2"][i]): continue
+            if not (P["c"][i] > P["s200"][i] and P["r2"][i] < p["rsi_lo"]): continue
+            S = P["c"][i]; exp = BT.day_index_after(P, i, p["dte"]); T = BT.T_years(P, i, exp); sig = BT.iv_at(P, i)
+            k1 = BT.snap(S, S); k2 = k1 + max(M.strike_step(S), BT.snap(S * p["width_pct"] / 100, S))
+            def val(j):
+                Tj = BT.T_years(P, j, exp); sj = BT.iv_at(P, j)
+                return BT.bs(P["c"][j], k1, Tj, sj, True) - BT.bs(P["c"][j], k2, Tj, sj, True)
+            mid = val(i); w = k2 - k1
+            if mid <= 0.05 or mid > 0.7 * w: continue
+            entry = mid + 0.04; out = None; j = i
+            while j + 1 < P["n"]:
+                j += 1
+                v = max(0.0, val(j) - 0.04)
+                why = None
+                if (v / entry - 1) * 100 >= p["tp"]: why = "tp"
+                elif (P["d"][j] - P["d"][i]).days >= p["hold_days"]: why = "time"
+                elif (exp - P["d"][j]).days <= 7: why = "expiry"
+                if why: out = (v, why); break
+            if not out: break
+            trades.append({"t": t, "d": P["t"][i], "pnl": (out[0] - entry) * 100 - 0.26, "risk": entry * 100, "r": out[0] / entry - 1,
+                           "why": out[1], "days": j - i, "stock_win": P["c"][j] > S})
+            busy = j
+    return trades
+
+
+def debit_report():
+    raw = json.loads(BT.BARS_F.read_text())
+    data = {t: enrich(BT.prep(B)) for t, B in raw.items() if len(B["c"]) > 400}
+    dates = sorted({P["t"][i] for P in data.values() for i in range(210, P["n"])}); split = dates[len(dates) // 2]
+    years = (dt.date.fromisoformat(dates[-1]) - dt.date.fromisoformat(dates[0])).days / 365
+    L = ["PULLBACK CALL DEBIT SPREADS · %d tickers · %s → %s · split %s" % (len(data), dates[0], dates[-1], split)]
+    for w, tp, hd, lo in itertools.product([1.5, 2.5, 4], [30, 50], [14, 21], [5, 10]):
+        p = dict(width_pct=w, tp=tp, hold_days=hd, rsi_lo=lo, dte=45)
+        tr = run_debit(data, p)
+        a = stats(tr); o = stats([x for x in tr if x["d"] < split]); n = stats([x for x in tr if x["d"] >= split])
+        if not (a and o and n): continue
+        ok = o["exp"] > 0 and n["exp"] > 0
+        L.append("%s width %.1f%% tp %d%% hold %dd RSI2<%d | n=%d (%.0f/yr) win %.0f%% avg %+.1f%% · older %.0f%%/%+.1f%% · newer %.0f%%/%+.1f%% · stock up %.0f%%" % (
+            "✅" if ok else "❌", w, tp, hd, lo, a["n"], a["n"] / years, a["wr"], a["avg_r"], o["wr"], o["avg_r"], n["wr"], n["avg_r"], a["stock_wr"]))
+    rep = "\n".join(L); print(rep); (BASE / "debit_report.txt").write_text(rep + "\n")
+
+
 def main():
+    if "--debit" in sys.argv:
+        return debit_report()
     if not BT.BARS_F.exists():
         sys.exit("Run backtest.py first (needs bt_bars.json).")
     raw = json.loads(BT.BARS_F.read_text())
