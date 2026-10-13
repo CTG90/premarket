@@ -17,3 +17,5 @@ relay/backtest_*.txt
 relay/backtest_results.json
 relay/small_account_*
 relay/swing_report.txt
+relay/edges_report.txt
+relay/edges_winners.json
