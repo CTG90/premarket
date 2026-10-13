@@ -27,6 +27,8 @@ import sys
 import uuid
 from pathlib import Path
 
+import keyfile  # noqa: F401  (loads ../.webull_paper into env if not sourced)
+
 SANDBOX_HOST = "api.sandbox.webull.com"        # current docs (paper/sandbox)
 OLD_UAT_HOST = "us-openapi-alb.uat.webullbroker.com"
 LIVE_HOST = "api.webull.com"

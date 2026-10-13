@@ -23,3 +23,4 @@ relay/iv_log.csv
 relay/debit_report.txt
 relay/ft_bars.json
 relay/futures_report.txt
+relay/accounts_output.txt

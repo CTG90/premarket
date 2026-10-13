@@ -30,6 +30,8 @@ import time
 import traceback
 import uuid
 from pathlib import Path
+
+import keyfile  # noqa: F401  (loads ../.webull_paper into env if not sourced)
 from zoneinfo import ZoneInfo
 
 BASE = Path(__file__).resolve().parent
@@ -1257,13 +1259,44 @@ def test_spread():
             break
 
 
+class _Tee:
+    def __init__(self, *streams): self.streams = streams
+    def write(self, x):
+        for st in self.streams:
+            try: st.write(x); st.flush()
+            except Exception: pass
+    def flush(self):
+        for st in self.streams:
+            try: st.flush()
+            except Exception: pass
+
+
+def tee_output(path):
+    f = open(path, "a", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, f); sys.stderr = _Tee(sys.__stderr__, f)
+
+
+def keep_awake():
+    """Windows: stop the PC from sleeping while the bot runs (Mac uses caffeinate in start-bot.command)."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)  # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        except Exception:
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--test-order", action="store_true")
     ap.add_argument("--test-spread", action="store_true")
+    ap.add_argument("--log", help="also append all output to this file (Windows has no tee)")
     a = ap.parse_args()
+    if a.log:
+        tee_output(a.log)
+    keep_awake()
     if a.test_order:
         return test_order()
     if a.test_spread:
