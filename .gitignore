@@ -21,3 +21,5 @@ relay/edges_report.txt
 relay/edges_winners.json
 relay/iv_log.csv
 relay/debit_report.txt
+relay/ft_bars.json
+relay/futures_report.txt
