@@ -17,9 +17,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 NAMES = {"spread": "Credit spreads", "lotto": "🎰 Lotto calls", "debit": "Dip call spreads", "call": "Dip single calls",
-         "etf_trend": "3x S&P trend (sim)", "etf_dip": "3x S&P dip (sim)", "sr": "📐 Support/resistance"}
+         "etf_trend": "3x S&P trend (sim)", "etf_dip": "3x S&P dip (sim)", "sr": "📐 Support/resistance", "etf_tom": "3x S&P turn-of-month (sim)", "vix": "🚨 VIX 30+ panic buy"}
 TARGETS = {"spread": "~75% win · +4-6%/trade", "lotto": "~20% win · 1 in 8 hits 5.8x", "debit": "~57% win · +6-10%/trade",
-           "call": "~58% win · ~+15%/trade", "etf_trend": "~17%/yr", "etf_dip": "~12-20%/yr", "sr": "unproven"}
+           "call": "~58% win · ~+15%/trade", "etf_trend": "~17%/yr", "etf_dip": "~12-20%/yr", "sr": "unproven", "etf_tom": "~16-18%/yr", "vix": "~68% win · +34-43%/trade"}
 MILESTONES = (15, 20, 25, 30, 40, 50, 75, 100, 150, 200, 300, 500)
 
 

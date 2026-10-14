@@ -68,7 +68,7 @@ DEFAULTS = {
     "lotto_max_spread_pct": 25,
     "pullback_enabled": True,     # call debit spreads on dips (own sleeve)
     # every proven strategy runs in its own sleeve: separate starting balance, sizing and scorecard
-    "sleeves": {"spread": 2500, "lotto": 2500, "debit": 2500, "call": 10000, "etf_trend": 2500, "etf_dip": 2500, "sr": 10000},
+    "sleeves": {"spread": 2500, "lotto": 2500, "debit": 2500, "call": 10000, "etf_trend": 2500, "etf_dip": 2500, "sr": 10000, "etf_tom": 2500, "vix": 10000},
     "call_enabled": True,         # single ATM call on a dip when VIX >= call_min_vix (33-yr test: ~+15%/trade on stocks)
     "call_min_vix": 20,
     "call_dte": 45,
@@ -79,6 +79,11 @@ DEFAULTS = {
     "etf_trend_enabled": True,    # 3x S&P (UPRO-style) when SPY > 200-day +3%, cash when < 200-day -3% (simulated, no orders)
     "etf_dip_enabled": True,      # 3x S&P on SPY RSI2 < 10 above 200-day, out when SPY closes above its 5-day avg (simulated)
     "etf_lev": 3,
+    "etf_tom_enabled": True,      # 3x S&P only for the turn of the month: in at the 5th-last trading day, out 8 trading days later (sim)
+    "vix_enabled": True,          # VIX >= 30: buy an SPY call debit spread (ATM / +3%), ~30 DTE, hold 20 trading days
+    "vix_trigger": 30,
+    "vix_hold_days": 28,          # calendar days ≈ 20 trading days
+    "vix_risk_pct": 10,
     "sr_enabled": True,           # support/resistance swing trades (UNPROVEN: 33-yr daily test showed no edge vs random)
     "sr_delta": 0.40,             # slightly OTM call/put
     "sr_dte": 21,
@@ -462,6 +467,25 @@ def friday_at_least(days):
     return d.isoformat()
 
 
+NYSE_HOLIDAYS = {"2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
+                 "2026-11-26", "2026-12-25", "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18",
+                 "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24"}
+
+
+def trading_days_left_in_month(d):
+    """Trading days AFTER date d through the end of its month."""
+    n = 0; x = d + dt.timedelta(days=1)
+    while x.month == d.month:
+        if x.weekday() < 5 and x.isoformat() not in NYSE_HOLIDAYS:
+            n += 1
+        x += dt.timedelta(days=1)
+    return n
+
+
+def is_trading_day(d):
+    return d.weekday() < 5 and d.isoformat() not in NYSE_HOLIDAYS
+
+
 def monthly_at_least(days):
     """Third Friday of the first month whose third Friday is >= today + days."""
     d0 = now_et().date() + dt.timedelta(days=days); y, mth = d0.year, d0.month
@@ -593,7 +617,7 @@ class Bot:
         self.quotes, self.ind, self.sigs, self.regime = {}, {}, [], {"k": "unknown", "why": []}
         self.last_tick = None; self.err = None; self.spread_sigs = []; self.pb_sigs = []; self.closes = {}
         self.vix = (0, None, ""); self.pb = {}; self.pb_label = None; self.lotto_sigs = []; self.call_sigs = []
-        self.bars = {}; self.day_hl = {}; self.levels = {}; self.levels_day = None; self.sr_sigs = []
+        self.bars = {}; self.day_hl = {}; self.levels = {}; self.levels_day = None; self.sr_sigs = []; self.vix_sig = ""
 
     # data
     def refresh_bars(self):
@@ -777,7 +801,7 @@ class Bot:
                 po = t.get(kind)
                 if not po or po.get("done"):
                     continue
-                if t.get("kind") in ("spread", "debit"):
+                if t.get("kind") in ("spread", "debit", "vix"):
                     code, body = self.wb.detail3(po["coid"])
                     if code != 200:
                         code, body = self.wb.detail(po["coid"])
@@ -803,7 +827,7 @@ class Bot:
                     else:
                         t["status"] = "open"; t.pop("close_order", None); say("Close order %s ended: %s — will retry" % (t["occ"], status), self.st)
                 elif age > 7 * 60:
-                    if t.get("kind") in ("spread", "debit"):
+                    if t.get("kind") in ("spread", "debit", "vix"):
                         c1, _ = self.wb.cancel3(po["coid"])
                     else:
                         c1, _ = self.wb.cancel(po["coid"])
@@ -812,7 +836,7 @@ class Bot:
     # exits
     def manage_exits(self, opts, trading):
         cfg = self.cfg
-        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") not in ("spread", "debit", "lotto", "call", "etf_trend", "etf_dip", "sr")]:
+        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") not in ("spread", "debit", "lotto", "call", "etf_trend", "etf_dip", "sr", "vix", "etf_tom")]:
             q = opts.get(t["occ"])
             if q:
                 bid, ask, mid = opt_px(q)
@@ -933,7 +957,7 @@ class Bot:
 
     def open_risk(self, kind=None):
         return sum(t.get("max_loss", 0) for t in self.st["trades"]
-                   if t["status"] in ("opening", "open", "closing") and (t.get("kind") == kind if kind else t.get("kind") in ("spread", "debit", "lotto", "call", "sr")))
+                   if t["status"] in ("opening", "open", "closing") and (t.get("kind") == kind if kind else t.get("kind") in ("spread", "debit", "lotto", "call", "sr", "vix")))
 
     def spread_qty(self):
         cfg = self.cfg
@@ -946,7 +970,7 @@ class Bot:
             return {"side": side, "quantity": str(t["qty"]), "symbol": t["ticker"], "strike_price": "%g" % k,
                     "option_expire_date": t["exp"], "instrument_type": "OPTION",
                     "option_type": "PUT" if t["right"] == "P" else "CALL", "market": "US"}
-        if t.get("kind") == "debit":
+        if t.get("kind") in ("debit", "vix"):
             legs = [leg("BUY", t["long_k"]), leg("SELL", t["short_k"])] if opening else [leg("SELL", t["long_k"]), leg("BUY", t["short_k"])]
         elif opening:
             legs = [leg("SELL", t["short_k"]), leg("BUY", t["long_k"])]
@@ -1407,7 +1431,7 @@ class Bot:
         if not (spy and ind and ind.get("sma200") and len(cl) >= 5):
             return
         S = spy["price"]; today = now_et().date().isoformat(); n = now_et(); mins = n.hour * 60 + n.minute
-        for kind in ("etf_trend", "etf_dip"):
+        for kind in ("etf_trend", "etf_dip", "etf_tom"):
             e = E.setdefault(kind, {"in": False, "val": None, "last": None, "tid": None, "day": None, "cost_day": None})
             t = next((x for x in self.st["trades"] if x.get("id") == e.get("tid")), None)
             if e["in"] and t and market and fresh:
@@ -1422,9 +1446,17 @@ class Bot:
             e["day"] = today; s200 = ind["sma200"]; sma5 = (sum(cl[-4:]) + S) / 5; r2 = self.rsi2_now("SPY")
             if kind == "etf_trend":
                 want_in = (S > s200 * 1.03) or (e["in"] and S >= s200 * 0.97)
+            elif kind == "etf_tom":
+                d0 = now_et().date()
+                if e["in"]:
+                    e["held"] = e.get("held", 0) + 1          # one decision per trading day
+                    want_in = e["held"] < 8
+                else:
+                    want_in = is_trading_day(d0) and trading_days_left_in_month(d0) == 4
+                    e["held"] = 0
             else:
                 want_in = (S <= sma5) if e["in"] else (S > s200 and r2 is not None and r2 < 10)
-            label = "3x S&P trend (sim)" if kind == "etf_trend" else "3x S&P dip (sim)"
+            label = {"etf_trend": "3x S&P trend (sim)", "etf_dip": "3x S&P dip (sim)", "etf_tom": "3x S&P turn-of-month (sim)"}[kind]
             if want_in and not e["in"]:
                 eq = self.equity(kind)
                 t = {"id": uuid.uuid4().hex[:10], "kind": kind, "ticker": "SPY", "dir": "C", "strike": 0, "exp": today, "occ": label,
@@ -1438,6 +1470,51 @@ class Bot:
                 e.update({"in": False, "val": None, "last": None, "tid": None})
             elif e["in"] and t:
                 t["exp"] = today
+
+    # -- VIX >= 30: buy the panic with an SPY call debit spread --
+    def vix_play(self, market, fresh):
+        cfg = self.cfg; spy = self.quotes.get("SPY"); n = now_et(); mins = n.hour * 60 + n.minute
+        opn = [t for t in self.st["trades"] if t.get("kind") == "vix" and t["status"] == "open"]
+        if opn and market and fresh:
+            snaps = self.wb.option_snapshots([o for t in opn for o in (t["long_occ"], t["short_occ"])])
+            for t in opn:
+                lq, sq = snaps.get(t["long_occ"]), snaps.get(t["short_occ"])
+                if not (lq and sq):
+                    continue
+                lb, la, lm = opt_px(lq); sb, sa, sm = opt_px(sq); mid, nat = lm - sm, lb - sa
+                t["mark"] = {"px": max(0.0, mid), "at": time.time()}
+                held = (time.time() - t["entry"]["at"]) / 86400
+                if held >= cfg["vix_hold_days"] or dte(t["exp"]) <= 2:
+                    limit = max(0.01, round(mid - (mid - nat) * 0.5, 2))
+                    coid = self.send_spread(self.spread_order(t, False, limit), "close " + t["occ"])
+                    if coid:
+                        t["close_order"] = {"coid": coid, "at": time.time(), "limit": limit, "reason": "Time exit (%d days)" % held}
+                        t["status"] = "closing"; say("📤 SELL %s for $%.2f · VIX play time exit" % (t["occ"], limit), self.st)
+        vix = (self.pb or {}).get("vix")
+        self.vix_sig = "VIX %s · buys when ≥ %d" % ("%.0f" % vix if vix else "?", cfg["vix_trigger"])
+        if not (cfg.get("vix_enabled") and market and fresh and spy and vix and vix >= cfg["vix_trigger"] and 920 <= mins <= 945 and not STOP_F.exists()):
+            return
+        recent = [t for t in self.st["trades"] if t.get("kind") == "vix" and t["status"] != "cancelled" and time.time() - t["created"] < cfg["vix_hold_days"] * 86400]
+        if recent:
+            self.vix_sig += " · already in one"; return
+        S = spy["price"]; iso = self.exp_for("SPY", 30, S); k1 = round_strike(S)
+        k2 = k1 + max(strike_step(S), round(S * 0.03 / strike_step(S)) * strike_step(S))
+        lo, so = occ("SPY", iso, "C", k1), occ("SPY", iso, "C", k2); sn = self.wb.option_snapshots([lo, so])
+        if not (sn.get(lo) and sn.get(so)):
+            say("VIX play: no quotes for SPY %g/%g %s" % (k1, k2, iso), self.st); return
+        lb, la, lm = opt_px(sn[lo]); sb, sa, sm = opt_px(sn[so]); mid, nat = lm - sm, la - sb
+        budget = self.equity("vix") * cfg["vix_risk_pct"] / 100; qty = max(1, int(budget // (nat * 100))) if nat > 0 else 1
+        if nat * 100 > budget * 2:
+            self.vix_sig += " · spread $%.0f too big for sleeve" % (nat * 100); return
+        limit = round(mid + (nat - mid) * self.chase("vix", "SPY"), 2)
+        t = {"id": uuid.uuid4().hex[:10], "kind": "vix", "ticker": "SPY", "right": "C", "dir": "C", "long_k": k1, "short_k": k2, "exp": iso,
+             "long_occ": lo, "short_occ": so, "occ": "SPY %g/%gC %s" % (k1, k2, iso[5:]), "strike": k1, "qty": qty, "play": "VIX ≥ %d panic buy" % cfg["vix_trigger"],
+             "score": None, "feat": {"vix": round(vix, 1)}, "created": time.time(), "entry": {"px": limit, "und": S, "at": time.time()},
+             "max_loss": limit * 100 * qty, "status": "opening"}
+        coid = self.send_spread(self.spread_order(t, True, limit), "open " + t["occ"])
+        if coid:
+            t["open_order"] = {"coid": coid, "at": time.time(), "limit": limit}; self.st["trades"].append(t)
+            say("🚨 VIX %.0f — BUY %dx %s call spread for $%.2f · hold ~4 weeks" % (vix, qty, t["occ"], limit), self.st)
 
     # -- support / resistance swing trades (calls and puts) --
     def build_levels(self):
@@ -1655,7 +1732,7 @@ class Bot:
                 say("Quotes look stale (holiday/halt?) — no trading this cycle", self.st)
             self.err = None
             self.check_pending()
-            singles = [t["occ"] for t in self.st["trades"] if t["status"] in ("open", "closing") and t.get("kind") not in ("spread", "debit", "etf_trend", "etf_dip")]  # lotto + call + legacy singles
+            singles = [t["occ"] for t in self.st["trades"] if t["status"] in ("open", "closing") and t.get("kind") not in ("spread", "debit", "vix", "etf_trend", "etf_dip", "etf_tom")]  # lotto + call + sr + legacy singles
             opts = self.wb.option_snapshots(singles) if singles else {}
             for step in (
                 lambda: self.manage_exits(opts, market and fresh),
@@ -1671,6 +1748,7 @@ class Bot:
                 lambda: self.call_entries(window and fresh),
                 lambda: self.sr_entries(window and fresh),
                 lambda: self.etf_sims(market, fresh),
+                lambda: self.vix_play(market, fresh),
             ):
                 try:
                     step()
@@ -1755,9 +1833,10 @@ def write_html(bot):
     TARGET = {"spread": "~75% win · +4-6%/trade", "lotto": "~20% win · 1 in 8 hits 5.8x · avg +30-50%",
               "debit": "~57% win · +6-10%/trade", "call": "~58% win · ~+15%/trade",
               "etf_trend": "~17%/yr · drops up to 50%", "etf_dip": "~12-20%/yr",
-              "sr": "UNPROVEN · daily test: no edge vs random"}
+              "sr": "UNPROVEN · daily test: no edge vs random", "etf_tom": "~16-18%/yr · in ~40% of days",
+              "vix": "~68% win · +34-43%/trade · ~2/yr"}
     NAME = {"spread": "Credit spreads", "lotto": "🎰 Lotto calls", "debit": "Dip call spreads", "call": "Dip single calls (VIX 20+)",
-            "etf_trend": "3x S&P trend (sim)", "etf_dip": "3x S&P dip (sim)", "sr": "📐 Support/resistance (test)"}
+            "etf_trend": "3x S&P trend (sim)", "etf_dip": "3x S&P dip (sim)", "sr": "📐 Support/resistance (test)", "etf_tom": "3x S&P turn-of-month (sim)", "vix": "🚨 VIX 30+ panic buy"}
     h.append("<h2>Strategy scorecard</h2><div class=c><table><tr><th>Strategy</th><th>Balance</th><th>Closed</th><th>Win</th><th>P&amp;L</th><th>Backtest target</th></tr>")
     for k in (cfg.get("sleeves") or {}):
         cl = [t for t in st["trades"] if t.get("kind") == k and t["status"] == "closed"]
