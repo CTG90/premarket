@@ -195,6 +195,8 @@ def run_credit(data, cache, p):
             short_k = snap(strike_for_delta(S, T, sig, p["delta"], call), S)
             width = p["width_usd"] if p["width_usd"] else max(M.strike_step(S), snap(S * p["width_pct"] / 100, S))
             long_k = short_k + width if call else short_k - width
+            if long_k <= 0 or short_k <= 0:
+                continue
             credit_mid = bs(S, short_k, T, sig, call) - bs(S, long_k, T, sig, call)
             credit = credit_mid * 0.95 - 0.02
             if credit < width * 0.08:

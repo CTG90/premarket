@@ -24,3 +24,5 @@ relay/debit_report.txt
 relay/ft_bars.json
 relay/futures_report.txt
 relay/accounts_output.txt
+relay/hist_bars.json
+relay/history_report.txt
