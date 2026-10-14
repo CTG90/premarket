@@ -62,7 +62,19 @@ DEFAULTS = {
     "lotto_max_premium": 3.00,    # skip contracts pricier than this (lotto = cheap tickets)
     "lotto_min_oi": 100,
     "lotto_max_spread_pct": 25,
-    "pullback_enabled": False,    # call debit spreads: off. Dragged the account in the 33-yr combo test; lotto replaces it     # uptrend + RSI(2) dip → call debit spread (cheap version of a pullback call)
+    "pullback_enabled": True,     # call debit spreads on dips (own sleeve)
+    # every proven strategy runs in its own sleeve: separate starting balance, sizing and scorecard
+    "sleeves": {"spread": 2500, "lotto": 2500, "debit": 2500, "call": 10000, "etf_trend": 2500, "etf_dip": 2500},
+    "call_enabled": True,         # single ATM call on a dip when VIX >= call_min_vix (33-yr test: ~+15%/trade on stocks)
+    "call_min_vix": 20,
+    "call_dte": 45,
+    "call_tp_pct": 50,
+    "call_max_hold_days": 21,
+    "call_risk_pct": 8,           # premium per trade as % of the sleeve (ATM calls are pricey: sleeve is $10K)
+    "call_max_open": 3,
+    "etf_trend_enabled": True,    # 3x S&P (UPRO-style) when SPY > 200-day +3%, cash when < 200-day -3% (simulated, no orders)
+    "etf_dip_enabled": True,      # 3x S&P on SPY RSI2 < 10 above 200-day, out when SPY closes above its 5-day avg (simulated)
+    "etf_lev": 3,     # uptrend + RSI(2) dip → call debit spread (cheap version of a pullback call)
     "pullback_rsi2": 5,           # backtest: RSI2<5 beat <10 on both halves of the data
     "pullback_dte": 45,
     "pullback_tp_pct": 50,        # close at +50% on the debit (best in debittest, Oct 13)
@@ -95,7 +107,7 @@ DEFAULTS = {
     "otm_pct": 2,
     "max_spread_pct": 12,      # skip contracts whose bid/ask spread is wider than this % of mid
     "min_open_interest": 50,
-    "max_orders_per_day": 5,   # new entries per day
+    "max_orders_per_day": 15,   # new entries per day
     "daily_loss_limit": 250,   # stop new entries for the day after this much realized loss
     "pause_calls_risk_off": True,
     "learn": True,
@@ -517,7 +529,7 @@ class Bot:
         self.st = load_json(STATE_F, None) or {"trades": [], "log": [], "exp_field": None, "created": time.time()}
         self.quotes, self.ind, self.sigs, self.regime = {}, {}, [], {"k": "unknown", "why": []}
         self.last_tick = None; self.err = None; self.spread_sigs = []; self.pb_sigs = []; self.closes = {}
-        self.vix = (0, None, ""); self.pb = {}; self.pb_label = None; self.lotto_sigs = []
+        self.vix = (0, None, ""); self.pb = {}; self.pb_label = None; self.lotto_sigs = []; self.call_sigs = []
 
     # data
     def refresh_bars(self):
@@ -668,7 +680,7 @@ class Bot:
     # exits
     def manage_exits(self, opts, trading):
         cfg = self.cfg
-        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") not in ("spread", "debit", "lotto")]:
+        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") not in ("spread", "debit", "lotto", "call", "etf_trend", "etf_dip")]:
             q = opts.get(t["occ"])
             if q:
                 bid, ask, mid = opt_px(q)
@@ -776,16 +788,24 @@ class Bot:
                 r["label"] = "DRY: would buy %s @ $%.2f" % (c["occ"], limit)
 
     # ── account sim ───────────────────────────────────────────────────
-    def equity(self):
-        realized = sum(pnl(t) for t in self.st["trades"] if t.get("kind") in ("spread", "debit", "lotto") and t["status"] == "closed")
-        return self.cfg["account_size"] + realized
+    def sleeve_start(self, kind):
+        return float((self.cfg.get("sleeves") or {}).get(kind, self.cfg["account_size"]))
 
-    def open_risk(self):
-        return sum(t.get("max_loss", 0) for t in self.st["trades"] if t.get("kind") in ("spread", "debit", "lotto") and t["status"] in ("opening", "open", "closing"))
+    def equity(self, kind=None):
+        """Sleeve equity = its starting balance + realized P&L of its own trades. No kind = all sleeves together."""
+        kinds = [kind] if kind else list((self.cfg.get("sleeves") or {"spread": 0}).keys())
+        total = 0.0
+        for k in kinds:
+            total += self.sleeve_start(k) + sum(pnl(t) for t in self.st["trades"] if t.get("kind") == k and t["status"] == "closed")
+        return total
+
+    def open_risk(self, kind=None):
+        return sum(t.get("max_loss", 0) for t in self.st["trades"]
+                   if t["status"] in ("opening", "open", "closing") and (t.get("kind") == kind if kind else t.get("kind") in ("spread", "debit", "lotto", "call")))
 
     def spread_qty(self):
         cfg = self.cfg
-        return max(1, min(cfg["spread_max_contracts"], int(self.equity() // cfg["scale_every"])))
+        return max(1, min(cfg["spread_max_contracts"], int(self.equity("spread") // cfg["scale_every"])))
 
     # ── credit spreads ────────────────────────────────────────────────
     def spread_order(self, t, opening, limit):
@@ -911,7 +931,7 @@ class Bot:
                 t["open_order"] = {"coid": coid, "at": time.time(), "limit": limit}
                 self.st["trades"].append(t)
                 row["label"] = "Order sent"; row["k"] = "held"
-                say("📥 SELL %dx %s for $%.2f credit · short Δ %.2f · max loss $%.0f · account $%.0f" % (t["qty"], t["occ"], limit, c["delta"] or 0, t["max_loss"], self.equity()), self.st)
+                say("📥 SELL %dx %s for $%.2f credit · short Δ %.2f · max loss $%.0f · account $%.0f" % (t["qty"], t["occ"], limit, c["delta"] or 0, t["max_loss"], self.equity("spread")), self.st)
         self.spread_sigs = rows
 
     def pick_spread(self, tk, S, right):
@@ -947,11 +967,11 @@ class Bot:
         mid = sm - lm; nat = sb - la
         if mid < w * cfg["spread_min_credit_pct"] / 100:
             return None, "credit $%.2f < %d%% of $%g width" % (mid, cfg["spread_min_credit_pct"], w)
-        qty = self.spread_qty(); eq = self.equity()
+        qty = self.spread_qty(); eq = self.equity("spread")
         loss = (w - mid) * 100 * qty
         if loss > eq * cfg["risk_per_trade_pct"] / 100:
             return None, "max loss $%.0f > %d%% of $%.0f" % (loss, cfg["risk_per_trade_pct"], eq)
-        if self.open_risk() + loss > eq * cfg["max_total_risk_pct"] / 100:
+        if self.open_risk("spread") + loss > eq * cfg["max_total_risk_pct"] / 100:
             return None, "would put >%d%% of account at risk" % cfg["max_total_risk_pct"]
         return {"short_k": short_k, "long_k": long_k, "exp": iso, "short_occ": short_occ, "long_occ": long_occ,
                 "mid": mid, "natural_credit": nat, "delta": f(sq.get("delta")), "iv": f(sq.get("imp_vol")), "qty": qty}, None
@@ -1039,7 +1059,7 @@ class Bot:
     def pick_debit(self, tk, S):
         cfg = self.cfg; iso = friday_at_least(cfg["pullback_dte"]); step = strike_step(S)
         long_k = round_strike(S)
-        cap = self.equity() * cfg["pullback_risk_pct"] / 100
+        cap = self.equity("debit") * cfg["pullback_risk_pct"] / 100
         widths = [step * k for k in (1, 2, 3, 4) if step * k <= S * 0.05] or [step]
         occs = [occ(tk, iso, "C", long_k)] + [occ(tk, iso, "C", long_k + w) for w in widths]
         snaps = self.wb.option_snapshots(occs)
@@ -1158,11 +1178,125 @@ class Bot:
             if best is None or sc < best[0]:
                 best = (sc, {"strike": k, "occ": occ(tk, iso, "C", k), "exp": iso, "bid": bid, "ask": ask, "mid": mid, "spread": sp, "oi": oi, "iv": f(q.get("imp_vol")), "delta": abs(d)})
         if not best: return None, why
-        c = best[1]; budget = self.equity() * cfg["lotto_risk_pct"] / 100
+        c = best[1]; budget = self.equity("lotto") * cfg["lotto_risk_pct"] / 100
         c["qty"] = max(1, int(budget // (c["ask"] * 100)))
-        if c["ask"] * 100 > max(budget, self.equity() * 0.06): return None, "ticket $%.0f > budget $%.0f" % (c["ask"] * 100, budget)
-        if self.open_risk() + c["ask"] * 100 * c["qty"] > self.equity() * cfg["max_total_risk_pct"] / 100: return None, "total risk cap"
+        if c["ask"] * 100 > max(budget, self.equity("lotto") * 0.06): return None, "ticket $%.0f > budget $%.0f" % (c["ask"] * 100, budget)
+        if self.open_risk("lotto") + c["ask"] * 100 * c["qty"] > self.equity("lotto") * cfg["max_total_risk_pct"] / 100: return None, "total risk cap"
         return c, None
+
+    # -- dip single calls (ATM, ~45 DTE, only when VIX >= call_min_vix) --
+    def manage_calls(self, opts, trading):
+        cfg = self.cfg
+        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") == "call"]:
+            q = opts.get(t["occ"])
+            if q:
+                bid, ask, mid = opt_px(q)
+                t["mark"] = {"px": bid or mid, "mid": mid, "at": time.time(), "iv": f(q.get("imp_vol")), "delta": f(q.get("delta"))}
+            if not trading or not q:
+                continue
+            bid, ask, mid = opt_px(q); gain = ((bid or mid) / t["entry"]["px"] - 1) * 100 if t["entry"]["px"] else 0
+            held = (time.time() - t["entry"]["at"]) / 86400; reason = None
+            if gain >= cfg["call_tp_pct"]: reason = "Take profit +%d%%" % cfg["call_tp_pct"]
+            elif held >= cfg["call_max_hold_days"]: reason = "Time exit (%d days)" % held
+            elif dte(t["exp"]) <= 7: reason = "Expiry exit"
+            if not reason:
+                continue
+            limit = max(0.01, round(mid - (ask - bid) * 0.25, 2)) if bid and ask else max(0.01, round(bid or mid, 2))
+            coid, _ = self.send(self.build(t, "SELL", limit), "close " + t["occ"])
+            if coid:
+                t["close_order"] = {"coid": coid, "at": time.time(), "limit": limit, "reason": reason}
+                t["status"] = "closing"
+                say("📤 SELL %s x%d @ $%.2f · %s" % (t["occ"], t["qty"], limit, reason), self.st)
+
+    def call_entries(self, window):
+        cfg = self.cfg; rows = []
+        n = now_et(); late = 915 <= n.hour * 60 + n.minute <= 950
+        vix = (self.pb or {}).get("vix")
+        for tk in [x for x in UNIVERSE if x not in ("SPY", "QQQ")]:
+            m, ind = self.quotes.get(tk), self.ind.get(tk)
+            row = {"t": tk, "m": m, "k": "none", "label": ""}
+            rows.append(row)
+            if not (m and ind and ind.get("sma200")):
+                row["label"] = "waiting for data"; continue
+            r2 = self.rsi2_now(tk); row["rsi2"] = r2
+            if m["price"] <= ind["sma200"]:
+                row["label"] = "Below 200-day - skip"; continue
+            if r2 is None or r2 >= cfg["pullback_rsi2"]:
+                row["label"] = "No dip (RSI2 %.0f)" % (r2 or 0); continue
+            if vix is None or vix < cfg["call_min_vix"]:
+                row["label"] = "Dip, but VIX %s < %d - wait for fear" % ("%.0f" % vix if vix else "?", cfg["call_min_vix"]); continue
+            if any(t["ticker"] == tk and t.get("kind") == "call" and t["status"] in ("opening", "open", "closing") for t in self.st["trades"]):
+                row["label"] = "In a position"; row["k"] = "held"; continue
+            row["k"] = "go"; row["label"] = "DIP + FEAR · RSI2 %.0f" % r2
+            if not (window and late and cfg.get("call_enabled") and not STOP_F.exists()):
+                if cfg.get("call_enabled"): row["label"] += " (buys 3:15-3:50)"
+                continue
+            if len([t for t in self.st["trades"] if t.get("kind") == "call" and t["status"] in ("opening", "open", "closing")]) >= cfg["call_max_open"]:
+                row["label"] += " · max open"; continue
+            if self.realized_today() <= -cfg["daily_loss_limit"] or len(self.today_entries()) >= cfg["max_orders_per_day"]:
+                row["label"] += " · daily limit"; continue
+            iso = friday_at_least(cfg["call_dte"]); k = round_strike(m["price"]); o = occ(tk, iso, "C", k)
+            q = self.wb.option_snapshots([o]).get(o)
+            if not q:
+                row["label"] += " · skip: no quote"; continue
+            bid, ask, mid = opt_px(q)
+            if not (bid and ask):
+                row["label"] += " · skip: no bid/ask"; continue
+            sp = (ask - bid) / mid * 100; budget = self.equity("call") * cfg["call_risk_pct"] / 100
+            if sp > 15:
+                row["label"] += " · skip: spread %.0f%%" % sp; continue
+            if ask * 100 > budget:
+                row["label"] += " · skip: $%.0f > sleeve budget $%.0f" % (ask * 100, budget); continue
+            limit = round(mid + (ask - mid) * 0.5, 2)
+            t = {"id": uuid.uuid4().hex[:10], "kind": "call", "ticker": tk, "dir": "C", "strike": k, "exp": iso, "occ": o, "qty": 1,
+                 "play": "Dip call (fear)", "score": None, "feat": {"rsi2": round(r2), "vix": round(vix)},
+                 "created": time.time(), "entry": {"px": limit, "und": m["price"], "at": time.time(), "iv": f(q.get("imp_vol")), "spread": sp},
+                 "max_loss": limit * 100, "status": "opening"}
+            coid, _ = self.send(self.build(t, "BUY", limit), "open " + o)
+            if coid:
+                t["open_order"] = {"coid": coid, "at": time.time(), "limit": limit}
+                self.st["trades"].append(t); row["k"] = "held"; row["label"] = "Order sent"
+                say("📥 BUY %s @ $%.2f · dip call (RSI2 %.0f, VIX %.0f) · max loss $%.0f" % (o, limit, r2, vix, limit * 100), self.st)
+        self.call_sigs = rows
+
+    # -- 3x S&P sims (no orders: tracked from live SPY moves, like holding UPRO) --
+    def etf_sims(self, market, fresh):
+        cfg = self.cfg; spy = self.quotes.get("SPY"); ind = self.ind.get("SPY"); cl = self.closes.get("SPY") or []
+        E = self.st.setdefault("etf", {}); L = cfg.get("etf_lev", 3)
+        if not (spy and ind and ind.get("sma200") and len(cl) >= 5):
+            return
+        S = spy["price"]; today = now_et().date().isoformat(); n = now_et(); mins = n.hour * 60 + n.minute
+        for kind in ("etf_trend", "etf_dip"):
+            e = E.setdefault(kind, {"in": False, "val": None, "last": None, "tid": None, "day": None, "cost_day": None})
+            t = next((x for x in self.st["trades"] if x.get("id") == e.get("tid")), None)
+            if e["in"] and t and market and fresh:
+                if e["last"]:
+                    e["val"] *= max(0.0, 1 + L * (S / e["last"] - 1))
+                e["last"] = S
+                if e.get("cost_day") != today:   # ~0.95% fund fee + 2x financing (~4%) a year, charged daily
+                    e["val"] *= 1 - (0.0095 + (L - 1) * 0.04) / 252; e["cost_day"] = today
+                t["mark"] = {"px": e["val"], "at": time.time()}
+            if not (cfg.get(kind + "_enabled") and market and fresh and 945 <= mins <= 955 and e.get("day") != today):
+                continue
+            e["day"] = today; s200 = ind["sma200"]; sma5 = (sum(cl[-4:]) + S) / 5; r2 = self.rsi2_now("SPY")
+            if kind == "etf_trend":
+                want_in = (S > s200 * 1.03) or (e["in"] and S >= s200 * 0.97)
+            else:
+                want_in = (S <= sma5) if e["in"] else (S > s200 and r2 is not None and r2 < 10)
+            label = "3x S&P trend (sim)" if kind == "etf_trend" else "3x S&P dip (sim)"
+            if want_in and not e["in"]:
+                eq = self.equity(kind)
+                t = {"id": uuid.uuid4().hex[:10], "kind": kind, "ticker": "SPY", "dir": "C", "strike": 0, "exp": today, "occ": label,
+                     "qty": 0.01, "play": label, "score": None, "feat": {"spy": round(S, 2), "rsi2": round(r2 or 0)},
+                     "created": time.time(), "entry": {"px": eq, "und": S, "at": time.time()}, "max_loss": 0, "status": "open"}
+                self.st["trades"].append(t); e.update({"in": True, "val": eq, "last": S, "tid": t["id"], "cost_day": today})
+                say("📈 %s: IN with $%.0f (SPY $%.2f)" % (label, eq, S), self.st)
+            elif e["in"] and not want_in and t:
+                t["exit"] = {"px": e["val"], "at": time.time(), "reason": "Signal off"}; t["status"] = "closed"
+                say("%s %s: OUT · $%.0f → $%.0f (%+.1f%%)" % ("✅" if e["val"] >= t["entry"]["px"] else "❌", label, t["entry"]["px"], e["val"], (e["val"] / t["entry"]["px"] - 1) * 100), self.st)
+                e.update({"in": False, "val": None, "last": None, "tid": None})
+            elif e["in"] and t:
+                t["exp"] = today
 
     def log_iv(self):
         n = now_et(); today = n.date().isoformat()
@@ -1214,16 +1348,19 @@ class Bot:
             if market and not fresh:
                 say("Quotes look stale (holiday/halt?) — no trading this cycle", self.st)
             self.check_pending()
-            singles = [t["occ"] for t in self.st["trades"] if t["status"] in ("open", "closing") and t.get("kind") not in ("spread", "debit")]  # includes lotto
+            singles = [t["occ"] for t in self.st["trades"] if t["status"] in ("open", "closing") and t.get("kind") not in ("spread", "debit", "etf_trend", "etf_dip")]  # lotto + call + legacy singles
             opts = self.wb.option_snapshots(singles) if singles else {}
             self.manage_exits(opts, market and fresh)
             self.manage_spreads(market and fresh)
             self.manage_debits(market and fresh)
             self.manage_lotto(opts, market and fresh)
+            self.manage_calls(opts, market and fresh)
             self.entries(window and fresh)
             self.spread_entries(window and fresh)
             self.pullback_entries(window and fresh)
             self.lotto_entries(window and fresh)
+            self.call_entries(window and fresh)
+            self.etf_sims(market, fresh)
             if market and fresh and mins >= 930:
                 try:
                     self.log_iv()
@@ -1288,13 +1425,27 @@ def write_html(bot):
         h.append("<div class='c' style='border-color:#0ea5e9;color:#7dd3fc'>🧭 %s%s</div>" % (esc(bot.pb["label"]), "" if bot.pb.get("src") == "VIX" else " <span class=m>(VIX %s)</span>" % esc(bot.pb.get("src", ""))))
     if bot.err:
         h.append("<div class='c' style='border-color:#ef4444;color:#f87171'>Last error: %s</div>" % esc(bot.err))
-    eq = bot.equity()
-    h.append("<div class='c k'><div><div class=l>Account (sim)</div><div class='v %s'>$%s</div></div>" % ("up" if eq >= cfg["account_size"] else "dn", format(round(eq), ",")))
+    eq = bot.equity(); start_all = sum((cfg.get("sleeves") or {}).values()) or cfg["account_size"]
+    h.append("<div class='c k'><div><div class=l>All sleeves (sim)</div><div class='v %s'>$%s</div><div class=m>started $%s</div></div>" % ("up" if eq >= start_all else "dn", format(round(eq), ","), format(round(start_all), ",")))
     h.append("<div><div class=l>At risk now</div><div class=v>$%.0f</div><div class=m>%.0f%% · %dx size</div></div>" % (bot.open_risk(), bot.open_risk() / eq * 100 if eq else 0, bot.spread_qty()))
     h.append("<div><div class=l>Total P&amp;L</div><div class='v %s'>%+.0f$</div></div>" % ("up" if total >= 0 else "dn", total))
     h.append("<div><div class=l>Win rate</div><div class=v>%s</div><div class=m>%d closed · %d open</div></div></div>" % ("%.0f%%" % s["wr"] if s["n"] else "--", s["n"], len(opn)))
     h.append("<div class=m>Regime: <b style='color:%s'>%s</b></div>" % (regc, reg["k"].upper()))
     h.append("<div class=m>%s</div>" % esc(" · ".join(reg["why"])))
+    TARGET = {"spread": "~75% win · +4-6%/trade", "lotto": "~20% win · 1 in 8 hits 5.8x · avg +30-50%",
+              "debit": "~57% win · +6-10%/trade", "call": "~58% win · ~+15%/trade",
+              "etf_trend": "~17%/yr · drops up to 50%", "etf_dip": "~12-20%/yr"}
+    NAME = {"spread": "Credit spreads", "lotto": "🎰 Lotto calls", "debit": "Dip call spreads", "call": "Dip single calls (VIX 20+)",
+            "etf_trend": "3x S&P trend (sim)", "etf_dip": "3x S&P dip (sim)"}
+    h.append("<h2>Strategy scorecard</h2><div class=c><table><tr><th>Strategy</th><th>Balance</th><th>Closed</th><th>Win</th><th>P&amp;L</th><th>Backtest target</th></tr>")
+    for k in (cfg.get("sleeves") or {}):
+        cl = [t for t in st["trades"] if t.get("kind") == k and t["status"] == "closed"]
+        op = [t for t in st["trades"] if t.get("kind") == k and t["status"] in ("opening", "open", "closing")]
+        pl = sum(pnl(t) for t in cl); start = bot.sleeve_start(k); bal = bot.equity(k) + sum(pnl(t) for t in op if t.get("kind", "").startswith("etf"))
+        h.append("<tr><td><b>%s</b><div class=m>%d open</div></td><td class=%s>$%s<div class=m>of $%s</div></td><td>%d</td><td>%s</td><td class=%s>%+.0f$</td><td class=m>%s</td></tr>" % (
+            NAME.get(k, k), len(op), "up" if bal >= start else "dn", format(round(bal), ","), format(round(start), ","), len(cl),
+            ("%.0f%%" % (100 * sum(pnl(t) > 0 for t in cl) / len(cl))) if cl else "--", "up" if pl >= 0 else "dn", pl, TARGET.get(k, "")))
+    h.append("</table><div class=m style='margin-top:6px'>Each strategy trades its own pretend balance. Lotto needs ~40-50 tickets before judging; 10 losers in a row is normal.</div></div>")
     h.append("<h2>Open positions</h2><div class=c>")
     if not opn:
         h.append("<div class=m>None.</div>")
@@ -1302,7 +1453,7 @@ def write_html(bot):
         h.append("<table><tr><th>Contract</th><th>Status</th><th>Entry</th><th>Mark</th><th>P&amp;L</th></tr>")
         for t in opn:
             mk = (t.get("mark") or {}).get("px")
-            info = ("score %d" % t["score"]) if t.get("score") is not None else ("credit $%.2f · max loss $%.0f" % (t["entry"]["px"], t.get("max_loss", 0)))
+            info = ("score %d" % t["score"]) if t.get("score") is not None else ("simulated · no orders" if str(t.get("kind", "")).startswith("etf") else ("credit $%.2f · max loss $%.0f" % (t["entry"]["px"], t.get("max_loss", 0))) if t.get("kind") == "spread" else ("paid $%.2f · max loss $%.0f" % (t["entry"]["px"], t.get("max_loss", 0))))
             h.append("<tr><td><b>%s</b><div class=m>%s · %s · %d DTE</div></td><td>%s</td><td>$%.2f</td><td>%s</td><td class=%s>%+.0f%%<div class=m>%+.0f$</div></td></tr>" % (
                 esc(t["occ"]), esc(t["play"]), info, max(0, dte(t["exp"])), t["status"], t["entry"]["px"],
                 "$%.2f" % mk if mk else "--", "up" if pnl(t) >= 0 else "dn", pnl_pct(t), pnl(t)))
@@ -1315,6 +1466,12 @@ def write_html(bot):
             r.get("trend", "--"), "g" if r["k"] in ("go", "held") else "", esc(r["label"])))
     h.append("</table></div><h2>🎰 Lotto calls · cheap OTM call on a dip · sell at " + "%.1fx" % cfg.get("lotto_tp_mult", 5.8) + " · " + "%d%%" % cfg.get("lotto_risk_pct", 3) + " per ticket</h2><div class=c><table><tr><th>Ticker</th><th>Price</th><th>RSI(2)</th><th>Status</th></tr>")
     for r in sorted(bot.lotto_sigs, key=lambda r: (r["k"] not in ("go", "held"), r["t"])):
+        m = r.get("m")
+        h.append("<tr><td><b>%s</b></td><td>%s</td><td>%s</td><td><span class='chip %s'>%s</span></td></tr>" % (
+            r["t"], ("$%.2f" % m["price"]) if m else "--", ("%.0f" % r["rsi2"]) if r.get("rsi2") is not None else "--",
+            "g" if r["k"] in ("go", "held") else "", esc(r["label"])))
+    h.append("</table></div><h2>Dip single calls · ATM, 45 days · only when VIX " + "%d+" % cfg.get("call_min_vix", 20) + "</h2><div class=c><table><tr><th>Ticker</th><th>Price</th><th>RSI(2)</th><th>Status</th></tr>")
+    for r in sorted(bot.call_sigs, key=lambda r: (r["k"] not in ("go", "held"), r["t"])):
         m = r.get("m")
         h.append("<tr><td><b>%s</b></td><td>%s</td><td>%s</td><td><span class='chip %s'>%s</span></td></tr>" % (
             r["t"], ("$%.2f" % m["price"]) if m else "--", ("%.0f" % r["rsi2"]) if r.get("rsi2") is not None else "--",
