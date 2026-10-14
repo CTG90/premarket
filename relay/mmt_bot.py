@@ -1934,7 +1934,7 @@ def keep_awake():
 
 
 RELOAD_CODE = 75
-CODE_FILES = [BASE / "mmt_bot.py", BASE / "keyfile.py"]
+CODE_FILES = [BASE / "mmt_bot.py", BASE / "keyfile.py", BASE / "phone_dash.py"]
 
 
 def code_stamp():
@@ -1972,6 +1972,12 @@ def main():
     bot = Bot(dry=a.dry)
     say("Make Me Trade bot started · host %s · %s" % (bot.wb.host, "DRY RUN" if a.dry else "paper orders"), bot.st)
     say("Dashboard: %s" % HTML_F)
+    if not a.once:
+        try:
+            import phone_dash
+            phone_dash.serve(bot, sys.modules[__name__], int(bot.cfg.get("dash_port", 8765)))
+        except Exception as e:
+            say("Phone dashboard error: %s" % e, bot.st)
     code_mtime = code_stamp()
     while True:
         bot.tick()
