@@ -53,7 +53,16 @@ DEFAULTS = {
     "max_total_risk_pct": 30,  # max loss across all open spreads as % of account
     "scale_every": 2500,       # +1 contract per spread for every $2,500 of account equity
     "spread_max_contracts": 10,
-    "pullback_enabled": True,     # uptrend + RSI(2) dip → call debit spread (cheap version of a pullback call)
+    "lotto_enabled": True,        # Perry's lotto: cheap OTM call on a dip in an uptrending stock, sell at lotto_tp_mult or let it ride
+    "lotto_delta": 0.15,          # target delta of the call (0.15 = cheap, far OTM)
+    "lotto_dte": 14,              # ~2 weeks out
+    "lotto_tp_mult": 5.8,         # sell when the option is worth 5.8x what we paid (0.20 -> 1.16)
+    "lotto_risk_pct": 3,          # premium per ticket as % of account
+    "lotto_max_open": 6,
+    "lotto_max_premium": 3.00,    # skip contracts pricier than this (lotto = cheap tickets)
+    "lotto_min_oi": 100,
+    "lotto_max_spread_pct": 25,
+    "pullback_enabled": False,    # call debit spreads: off. Dragged the account in the 33-yr combo test; lotto replaces it     # uptrend + RSI(2) dip → call debit spread (cheap version of a pullback call)
     "pullback_rsi2": 5,           # backtest: RSI2<5 beat <10 on both halves of the data
     "pullback_dte": 45,
     "pullback_tp_pct": 50,        # close at +50% on the debit (best in debittest, Oct 13)
@@ -508,7 +517,7 @@ class Bot:
         self.st = load_json(STATE_F, None) or {"trades": [], "log": [], "exp_field": None, "created": time.time()}
         self.quotes, self.ind, self.sigs, self.regime = {}, {}, [], {"k": "unknown", "why": []}
         self.last_tick = None; self.err = None; self.spread_sigs = []; self.pb_sigs = []; self.closes = {}
-        self.vix = (0, None, ""); self.pb = {}; self.pb_label = None
+        self.vix = (0, None, ""); self.pb = {}; self.pb_label = None; self.lotto_sigs = []
 
     # data
     def refresh_bars(self):
@@ -659,7 +668,7 @@ class Bot:
     # exits
     def manage_exits(self, opts, trading):
         cfg = self.cfg
-        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") not in ("spread", "debit")]:
+        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") not in ("spread", "debit", "lotto")]:
             q = opts.get(t["occ"])
             if q:
                 bid, ask, mid = opt_px(q)
@@ -768,11 +777,11 @@ class Bot:
 
     # ── account sim ───────────────────────────────────────────────────
     def equity(self):
-        realized = sum(pnl(t) for t in self.st["trades"] if t.get("kind") in ("spread", "debit") and t["status"] == "closed")
+        realized = sum(pnl(t) for t in self.st["trades"] if t.get("kind") in ("spread", "debit", "lotto") and t["status"] == "closed")
         return self.cfg["account_size"] + realized
 
     def open_risk(self):
-        return sum(t.get("max_loss", 0) for t in self.st["trades"] if t.get("kind") in ("spread", "debit") and t["status"] in ("opening", "open", "closing"))
+        return sum(t.get("max_loss", 0) for t in self.st["trades"] if t.get("kind") in ("spread", "debit", "lotto") and t["status"] in ("opening", "open", "closing"))
 
     def spread_qty(self):
         cfg = self.cfg
@@ -1055,6 +1064,106 @@ class Bot:
         return best, None
 
     # ── implied-vol log (one row per ticker per day) ──────────────────
+    # -- lotto calls (Perry's: cheap OTM call on a dip, sell at ~5.8x or ride to expiry) --
+    def manage_lotto(self, opts, trading):
+        cfg = self.cfg
+        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") == "lotto"]:
+            q = opts.get(t["occ"])
+            if q:
+                bid, ask, mid = opt_px(q)
+                t["mark"] = {"px": bid or mid, "mid": mid, "at": time.time(), "iv": f(q.get("imp_vol")), "delta": f(q.get("delta"))}
+            if not trading or not q:
+                continue
+            bid, ask, mid = opt_px(q); d = dte(t["exp"]); reason = None
+            if bid and bid >= t["entry"]["px"] * cfg["lotto_tp_mult"]:
+                reason = "Lotto hit %.1fx" % (bid / t["entry"]["px"])
+            elif d <= 0.3 and bid and bid >= 0.05:
+                reason = "Expiry day - salvage"
+            if not reason:
+                continue
+            limit = max(0.01, round(mid - (ask - bid) * 0.25, 2)) if bid and ask else max(0.01, round(bid or mid, 2))
+            coid, _ = self.send(self.build(t, "SELL", limit), "close " + t["occ"])
+            if coid:
+                t["close_order"] = {"coid": coid, "at": time.time(), "limit": limit, "reason": reason}
+                t["status"] = "closing"
+                say("🎰 SELL %s x%d @ $%.2f · %s (paid $%.2f)" % (t["occ"], t["qty"], limit, reason, t["entry"]["px"]), self.st)
+        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") == "lotto" and dte(x["exp"]) < -0.2]:
+            t["exit"] = {"px": 0.0, "at": time.time(), "reason": "Expired worthless"}; t["status"] = "closed"
+            say("❌ %s expired worthless · -$%.0f" % (t["occ"], t["entry"]["px"] * 100 * t["qty"]), self.st)
+
+    def lotto_entries(self, window):
+        cfg = self.cfg; rows = []
+        n = now_et(); late = 915 <= n.hour * 60 + n.minute <= 950
+        for tk in [x for x in UNIVERSE if x not in ("SPY", "QQQ")]:
+            m, ind = self.quotes.get(tk), self.ind.get(tk)
+            row = {"t": tk, "m": m, "k": "none", "label": ""}
+            rows.append(row)
+            if not (m and ind and ind.get("sma200")):
+                row["label"] = "waiting for data"; continue
+            r2 = self.rsi2_now(tk); row["rsi2"] = r2
+            if m["price"] <= ind["sma200"]:
+                row["label"] = "Below 200-day - skip"; continue
+            cl = self.closes.get(tk) or []
+            if len(cl) > 5 and m["price"] / cl[-5] - 1 <= -0.10:
+                row["label"] = "Down 10%+ in a week - falling knife, skip"; continue
+            if r2 is None or r2 >= cfg["pullback_rsi2"]:
+                row["label"] = "No dip (RSI2 %.0f)" % (r2 or 0); continue
+            if any(t["ticker"] == tk and t.get("kind") == "lotto" and t["status"] in ("opening", "open", "closing") for t in self.st["trades"]):
+                row["label"] = "Holding a ticket"; row["k"] = "held"; continue
+            row["k"] = "go"; row["label"] = "DIP · RSI2 %.0f" % r2
+            if not (window and late and cfg.get("lotto_enabled") and not STOP_F.exists()):
+                if cfg.get("lotto_enabled"): row["label"] += " (buys 3:15-3:50)"
+                continue
+            if len([t for t in self.st["trades"] if t.get("kind") == "lotto" and t["status"] in ("opening", "open", "closing")]) >= cfg["lotto_max_open"]:
+                row["label"] += " · max tickets open"; continue
+            if self.realized_today() <= -cfg["daily_loss_limit"] or len(self.today_entries()) >= cfg["max_orders_per_day"]:
+                row["label"] += " · daily limit"; continue
+            c, why = self.pick_lotto(tk, m["price"])
+            if not c:
+                row["label"] += " · skip: " + why; continue
+            limit = round(c["mid"] + (c["ask"] - c["mid"]) * 0.5, 2)
+            t = {"id": uuid.uuid4().hex[:10], "kind": "lotto", "ticker": tk, "dir": "C", "strike": c["strike"], "exp": c["exp"],
+                 "occ": c["occ"], "qty": c["qty"], "play": "Lotto call", "score": None, "feat": {"rsi2": round(r2), "delta": c["delta"]},
+                 "created": time.time(), "entry": {"px": limit, "und": m["price"], "at": time.time(), "iv": c["iv"], "spread": c["spread"]},
+                 "max_loss": limit * 100 * c["qty"], "status": "opening"}
+            coid, _ = self.send(self.build(t, "BUY", limit), "open " + c["occ"])
+            if coid:
+                t["open_order"] = {"coid": coid, "at": time.time(), "limit": limit}
+                self.st["trades"].append(t); row["k"] = "held"; row["label"] = "Ticket bought"
+                say("🎰 BUY %dx %s @ $%.2f · lotto (RSI2 %.0f, delta %.2f) · target $%.2f · max loss $%.0f" % (
+                    t["qty"], c["occ"], limit, r2, c["delta"] or 0, limit * cfg["lotto_tp_mult"], t["max_loss"]), self.st)
+            elif self.dry:
+                row["label"] = "DRY: would buy %s @ $%.2f" % (c["occ"], limit)
+        self.lotto_sigs = rows
+
+    def pick_lotto(self, tk, S):
+        """Scan OTM calls; take the one closest to lotto_delta that passes liquidity and price checks."""
+        cfg = self.cfg; iso = friday_at_least(cfg["lotto_dte"]); step = strike_step(S)
+        k0 = round_strike(S); ks = [k0 + step * i for i in range(1, 13)]
+        snaps = self.wb.option_snapshots([occ(tk, iso, "C", k) for k in ks])
+        best = None; why = "no listed calls"
+        for k in ks:
+            q = snaps.get(occ(tk, iso, "C", k))
+            if not q: continue
+            bid, ask, mid = opt_px(q); d = f(q.get("delta"))
+            if not (bid and ask and mid): why = "no bid/ask"; continue
+            if d is None: d = 0.5 * math.exp(-((k / S - 1) * 12))
+            if abs(d) > 0.40: continue
+            sp = (ask - bid) / mid * 100; oi = f(q.get("open_interest"), 0)
+            if sp > cfg["lotto_max_spread_pct"]: why = "spread %.0f%%" % sp; continue
+            if oi < cfg["lotto_min_oi"]: why = "open interest %d" % oi; continue
+            if ask > cfg["lotto_max_premium"]: why = "too pricey ($%.2f)" % ask; continue
+            if ask < 0.05: why = "too cheap to be real"; continue
+            sc = abs(abs(d) - cfg["lotto_delta"])
+            if best is None or sc < best[0]:
+                best = (sc, {"strike": k, "occ": occ(tk, iso, "C", k), "exp": iso, "bid": bid, "ask": ask, "mid": mid, "spread": sp, "oi": oi, "iv": f(q.get("imp_vol")), "delta": abs(d)})
+        if not best: return None, why
+        c = best[1]; budget = self.equity() * cfg["lotto_risk_pct"] / 100
+        c["qty"] = max(1, int(budget // (c["ask"] * 100)))
+        if c["ask"] * 100 > max(budget, self.equity() * 0.06): return None, "ticket $%.0f > budget $%.0f" % (c["ask"] * 100, budget)
+        if self.open_risk() + c["ask"] * 100 * c["qty"] > self.equity() * cfg["max_total_risk_pct"] / 100: return None, "total risk cap"
+        return c, None
+
     def log_iv(self):
         n = now_et(); today = n.date().isoformat()
         if not self.cfg.get("iv_log") or self.st.get("iv_logged") == today:
@@ -1105,14 +1214,16 @@ class Bot:
             if market and not fresh:
                 say("Quotes look stale (holiday/halt?) — no trading this cycle", self.st)
             self.check_pending()
-            singles = [t["occ"] for t in self.st["trades"] if t["status"] in ("open", "closing") and t.get("kind") not in ("spread", "debit")]
+            singles = [t["occ"] for t in self.st["trades"] if t["status"] in ("open", "closing") and t.get("kind") not in ("spread", "debit")]  # includes lotto
             opts = self.wb.option_snapshots(singles) if singles else {}
             self.manage_exits(opts, market and fresh)
             self.manage_spreads(market and fresh)
             self.manage_debits(market and fresh)
+            self.manage_lotto(opts, market and fresh)
             self.entries(window and fresh)
             self.spread_entries(window and fresh)
             self.pullback_entries(window and fresh)
+            self.lotto_entries(window and fresh)
             if market and fresh and mins >= 930:
                 try:
                     self.log_iv()
@@ -1202,7 +1313,13 @@ def write_html(bot):
         h.append("<tr><td><b>%s</b></td><td>%s</td><td>%s</td><td><span class='chip %s'>%s</span></td></tr>" % (
             r["t"], ("$%.2f <span class=%s>%+.2f%%</span>" % (m["price"], "up" if m["pct"] >= 0 else "dn", m["pct"])) if m else "--",
             r.get("trend", "--"), "g" if r["k"] in ("go", "held") else "", esc(r["label"])))
-    h.append("</table></div><h2>Pullback calls (call debit spreads)</h2><div class=c><table><tr><th>Ticker</th><th>Price</th><th>RSI(2)</th><th>Status</th></tr>")
+    h.append("</table></div><h2>🎰 Lotto calls · cheap OTM call on a dip · sell at " + "%.1fx" % cfg.get("lotto_tp_mult", 5.8) + " · " + "%d%%" % cfg.get("lotto_risk_pct", 3) + " per ticket</h2><div class=c><table><tr><th>Ticker</th><th>Price</th><th>RSI(2)</th><th>Status</th></tr>")
+    for r in sorted(bot.lotto_sigs, key=lambda r: (r["k"] not in ("go", "held"), r["t"])):
+        m = r.get("m")
+        h.append("<tr><td><b>%s</b></td><td>%s</td><td>%s</td><td><span class='chip %s'>%s</span></td></tr>" % (
+            r["t"], ("$%.2f" % m["price"]) if m else "--", ("%.0f" % r["rsi2"]) if r.get("rsi2") is not None else "--",
+            "g" if r["k"] in ("go", "held") else "", esc(r["label"])))
+    h.append("</table></div><h2>Pullback calls (call debit spreads · " + ("on" if cfg.get("pullback_enabled") else "off, replaced by lotto calls") + ")</h2><div class=c><table><tr><th>Ticker</th><th>Price</th><th>RSI(2)</th><th>Status</th></tr>")
     for r in sorted(bot.pb_sigs, key=lambda r: (r["k"] not in ("go", "held"), r["t"])):
         m = r.get("m")
         h.append("<tr><td><b>%s</b></td><td>%s</td><td>%s</td><td><span class='chip %s'>%s</span></td></tr>" % (
