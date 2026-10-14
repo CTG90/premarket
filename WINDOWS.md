@@ -22,3 +22,13 @@ Manual start: **start-bot.bat**. Stop: close its window.
 ## Rules
 - **Run ONE bot per Webull account.** Mac and PC at the same time = double orders. Stop the Mac bot before starting the PC.
 - Dashboard: `relay\status.html`. Log: `relay\bot.log`. Pause new entries: create a file named `STOP` in the MakeMeTrade folder.
+
+## Phone dashboard
+The bot serves a read-only live dashboard on port 8765. On start it saves the link (with its private key) to `relay\phone_link.txt`.
+- When Windows Firewall asks, allow Python on **Private** networks.
+- Same Wi-Fi: open the link on your phone → Share → Add to Home Screen.
+- Away from home: install Tailscale on this PC and your phone, and use the PC's Tailscale name instead of the IP.
+- Tip: reserve this PC's IP in your router so the link never changes.
+
+## Updates
+The bot reloads itself within ~15 s when its code is updated. No restart needed.
