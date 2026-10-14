@@ -713,7 +713,7 @@ class Bot:
                 t["mfe"] = round(p, 1); t["mfe_at"] = now
             if t.get("mae") is None or p < t["mae"]:
                 t["mae"] = round(p, 1); t["mae_at"] = now
-            for lvl in (25, 50, 100):
+            for lvl in (15, 20, 25, 30, 40, 50, 75, 100, 150, 200, 300, 500):
                 if p >= lvl and not t.get("hit_%d" % lvl):
                     t["hit_%d" % lvl] = now
             rows.append("%s,%s,%s,%s,%.4f,%.1f\n" % (dt.datetime.fromtimestamp(now, ET).strftime("%Y-%m-%d %H:%M"), t["id"], t.get("kind"), t["occ"], t["mark"]["px"], p))
@@ -1776,7 +1776,8 @@ def write_html(bot):
             mk = (t.get("mark") or {}).get("px")
             info = ("score %d" % t["score"]) if t.get("score") is not None else ("simulated · no orders" if str(t.get("kind", "")).startswith("etf") else ("credit $%.2f · max loss $%.0f" % (t["entry"]["px"], t.get("max_loss", 0))) if t.get("kind") == "spread" else ("paid $%.2f · max loss $%.0f" % (t["entry"]["px"], t.get("max_loss", 0))))
             if t.get("mfe") is not None:
-                info += " · best %+.0f%% / worst %+.0f%%" % (t["mfe"], t["mae"])
+                hits = [l for l in (15, 20, 25, 30, 40, 50, 75, 100, 150, 200, 300, 500) if t.get("hit_%d" % l)]
+                info += " · best %+.0f%% / worst %+.0f%%%s" % (t["mfe"], t["mae"], (" · hit +" + "/".join(str(l) for l in hits) + "%") if hits else "")
             h.append("<tr><td><b>%s</b><div class=m>%s · %s · %d DTE</div></td><td>%s</td><td>$%.2f</td><td>%s</td><td class=%s>%+.0f%%<div class=m>%+.0f$</div></td></tr>" % (
                 esc(t["occ"]), esc(t["play"]), info, max(0, dte(t["exp"])), t["status"], t["entry"]["px"],
                 "$%.2f" % mk if mk else "--", "up" if pnl(t) >= 0 else "dn", pnl_pct(t), pnl(t)))
