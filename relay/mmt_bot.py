@@ -70,6 +70,7 @@ DEFAULTS = {
     "spread_ladder": 2,        # max open spreads per ticker
     "spread_spacing_days": 7,  # at most one new spread per ticker per week
     "spread_max_rsi": 70,      # skip bull puts when RSI is above this
+    "spread_max_hv": 25,       # skip new spreads when 20-day vol > 25% (crash conditions; 33-yr test: +1%/yr)
     "spread_both_sides": True, # bear call spreads in downtrends
     "spread_min_credit_pct": 20,  # credit must be ≥ 20% of width
     "contracts": 1,            # contracts per trade (hard cap below)
@@ -829,6 +830,8 @@ class Bot:
                 right = "C"
             else:
                 row["label"] = "No trend (%s) — sit out" % tr; continue
+            if ind.get("hv") and ind["hv"] > cfg.get("spread_max_hv", 99):
+                row["label"] = "Volatility %d%% > %d%% — sit out" % (ind["hv"], cfg["spread_max_hv"]); continue
             if right == "P" and ind["rsi"] is not None and ind["rsi"] > cfg["spread_max_rsi"]:
                 row["label"] = "RSI %d > %d — wait" % (ind["rsi"], cfg["spread_max_rsi"]); continue
             mine = [t for t in self.st["trades"] if t.get("kind") == "spread" and t["ticker"] == tk and t["status"] in ("opening", "open", "closing")]
