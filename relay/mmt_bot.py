@@ -1933,6 +1933,27 @@ def keep_awake():
             pass
 
 
+RELOAD_CODE = 75
+CODE_FILES = [BASE / "mmt_bot.py", BASE / "keyfile.py"]
+
+
+def code_stamp():
+    return tuple(int(f.stat().st_mtime) if f.exists() else 0 for f in CODE_FILES)
+
+
+def code_ok():
+    """Only reload into code that compiles, so a half-copied file can't crash the bot."""
+    import py_compile
+    try:
+        for f in CODE_FILES:
+            if f.exists():
+                py_compile.compile(str(f), doraise=True)
+        return True
+    except Exception as e:
+        print("Update found but it doesn't compile yet (%s) — keeping the running version" % str(e)[:120], flush=True)
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
@@ -1951,13 +1972,21 @@ def main():
     bot = Bot(dry=a.dry)
     say("Make Me Trade bot started · host %s · %s" % (bot.wb.host, "DRY RUN" if a.dry else "paper orders"), bot.st)
     say("Dashboard: %s" % HTML_F)
+    code_mtime = code_stamp()
     while True:
         bot.tick()
         if a.once:
             break
         s = bot.sleep_s()
         try:
-            time.sleep(s)
+            end = time.time() + s
+            while time.time() < end:
+                time.sleep(min(15, max(0, end - time.time())))
+                if code_stamp() != code_mtime and code_ok():
+                    save_json(STATE_F, bot.st)
+                    say("🔄 Update detected — reloading the bot", bot.st)
+                    save_json(STATE_F, bot.st)
+                    sys.exit(RELOAD_CODE)          # the launcher restarts it right away with the new code
         except KeyboardInterrupt:
             break
     save_json(STATE_F, bot.st)

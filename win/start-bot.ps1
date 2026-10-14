@@ -13,6 +13,7 @@ Write-Host ''
 Start-Process cmd -ArgumentList '/c timeout /t 30 /nobreak >nul & start "" "status.html"' -WindowStyle Hidden -WorkingDirectory $relay
 while ($true) {
     & $vpy -u mmt_bot.py --log bot.log
+    if ($LASTEXITCODE -eq 75) { Write-Host 'Update detected - reloading the bot...'; continue }
     Write-Host "`nBot exited (code $LASTEXITCODE). Restarting in 60 seconds - close this window to stop it for good."
     Start-Sleep -Seconds 60
 }
