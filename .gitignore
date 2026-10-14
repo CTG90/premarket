@@ -26,3 +26,5 @@ relay/futures_report.txt
 relay/accounts_output.txt
 relay/hist_bars.json
 relay/history_report.txt
+relay/intraday_bars.json
+relay/intraday_report.txt
