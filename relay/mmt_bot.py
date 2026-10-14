@@ -700,6 +700,13 @@ class Bot:
         cache[key] = pick
         return pick
 
+    def chase(self, kind, tk):
+        """Fraction of the way from mid to the far side to price an entry: 0.5, then 0.75, then 1.0 after unfilled tries today."""
+        d = now_et().date().isoformat()
+        n = sum(1 for t in self.st["trades"] if t.get("kind") == kind and t["ticker"] == tk and t["status"] == "cancelled"
+                and dt.datetime.fromtimestamp(t["created"], ET).date().isoformat() == d)
+        return min(1.0, 0.5 + 0.25 * n)
+
     # helpers
     def open_trades(self, spreads=True):
         return [t for t in self.st["trades"] if t["status"] in ("opening", "open", "closing") and (spreads or t.get("kind") not in ("spread", "debit"))]
@@ -1018,8 +1025,8 @@ class Bot:
             c, why = self.pick_spread(tk, m["price"], right)
             if not c:
                 row["label"] = "Skip: " + why; continue
-            limit = round(c["mid"] - (c["mid"] - c["natural_credit"]) * 0.25, 2)
-            limit = max(limit, round(c["natural_credit"], 2))
+            limit = round(c["mid"] - (c["mid"] - c["natural_credit"]) * self.chase("spread", tk), 2)
+            limit = max(limit, round(c["natural_credit"], 2), 0.05)
             t = {"id": uuid.uuid4().hex[:10], "kind": "spread", "ticker": tk, "right": right, "dir": right,
                  "short_k": c["short_k"], "long_k": c["long_k"], "exp": c["exp"], "short_occ": c["short_occ"], "long_occ": c["long_occ"],
                  "occ": "%s %g/%g%s %s" % (tk, c["short_k"], c["long_k"], right, c["exp"][5:]), "strike": c["short_k"],
@@ -1152,7 +1159,7 @@ class Bot:
             c, why = self.pick_debit(tk, m["price"])
             if not c:
                 row["label"] += " · skip: " + why; continue
-            limit = round(c["mid"] + (c["natural"] - c["mid"]) * 0.25, 2)
+            limit = round(c["mid"] + (c["natural"] - c["mid"]) * self.chase("debit", tk), 2)
             t = {"id": uuid.uuid4().hex[:10], "kind": "debit", "ticker": tk, "right": "C", "dir": "C",
                  "long_k": c["long_k"], "short_k": c["short_k"], "exp": c["exp"], "long_occ": c["long_occ"], "short_occ": c["short_occ"],
                  "occ": "%s %g/%gC %s" % (tk, c["long_k"], c["short_k"], c["exp"][5:]), "strike": c["long_k"], "qty": c["qty"],
@@ -1251,7 +1258,7 @@ class Bot:
             c, why = self.pick_lotto(tk, m["price"])
             if not c:
                 row["label"] += " · skip: " + why; continue
-            limit = round(c["mid"] + (c["ask"] - c["mid"]) * 0.5, 2)
+            limit = round(c["mid"] + (c["ask"] - c["mid"]) * self.chase("lotto", tk), 2)
             t = {"id": uuid.uuid4().hex[:10], "kind": "lotto", "ticker": tk, "dir": "C", "strike": c["strike"], "exp": c["exp"],
                  "occ": c["occ"], "qty": c["qty"], "play": "Lotto call", "score": None, "feat": {"rsi2": round(r2), "delta": c["delta"]},
                  "created": time.time(), "entry": {"px": limit, "und": m["price"], "at": time.time(), "iv": c["iv"], "spread": c["spread"]},
@@ -1357,7 +1364,7 @@ class Bot:
                 row["label"] += " · skip: spread %.0f%%" % sp; continue
             if ask * 100 > budget:
                 row["label"] += " · skip: $%.0f > sleeve budget $%.0f" % (ask * 100, budget); continue
-            limit = round(mid + (ask - mid) * 0.5, 2)
+            limit = round(mid + (ask - mid) * self.chase("call", tk), 2)
             t = {"id": uuid.uuid4().hex[:10], "kind": "call", "ticker": tk, "dir": "C", "strike": k, "exp": iso, "occ": o, "qty": 1,
                  "play": "Dip call (fear)", "score": None, "feat": {"rsi2": round(r2), "vix": round(vix)},
                  "created": time.time(), "entry": {"px": limit, "und": m["price"], "at": time.time(), "iv": f(q.get("imp_vol")), "spread": sp},
@@ -1501,7 +1508,7 @@ class Bot:
                 row["label"] = "In a position"; row["k"] = "held"; continue
             if not (window and 600 <= mins <= 930 and cfg.get("sr_enabled") and not STOP_F.exists()):
                 continue
-            if any(t["ticker"] == tk and t.get("kind") == "sr" for t in self.today_entries()):
+            if any(t["ticker"] == tk and t.get("kind") == "sr" and t["status"] != "cancelled" for t in self.today_entries()):
                 row["label"] += " · traded today"; continue
             if len([t for t in self.st["trades"] if t.get("kind") == "sr" and t["status"] in ("opening", "open", "closing")]) >= cfg["sr_max_open"]:
                 row["label"] += " · max open"; continue
@@ -1512,7 +1519,7 @@ class Bot:
             c, whyc = self.pick_sr(tk, m["price"], d)
             if not c:
                 row["label"] += " · skip: " + whyc; continue
-            limit = round(c["mid"] + (c["ask"] - c["mid"]) * 0.5, 2)
+            limit = round(c["mid"] + (c["ask"] - c["mid"]) * self.chase("sr", tk), 2)
             t = {"id": uuid.uuid4().hex[:10], "kind": "sr", "ticker": tk, "dir": d, "strike": c["strike"], "exp": c["exp"], "occ": c["occ"],
                  "qty": c["qty"], "play": "S/R " + setup, "score": None, "feat": {"level": round(lvl, 2), "why": why},
                  "created": time.time(), "entry": {"px": limit, "und": m["price"], "at": time.time(), "iv": c["iv"], "spread": c["spread"]},
