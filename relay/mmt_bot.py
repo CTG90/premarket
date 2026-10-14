@@ -203,7 +203,7 @@ class WB:
             return getattr(res, "text", None)
 
     def snapshot(self, syms):
-        res = self.dc.market_data.get_snapshot(",".join(syms), self.Cat.US_STOCK.name)
+        res = self.paced(self.dc.market_data.get_snapshot, ",".join(syms), self.Cat.US_STOCK.name)
         out = {}
         for q in (self.body(res) or []):
             if isinstance(q, dict) and q.get("symbol"):
@@ -211,7 +211,7 @@ class WB:
         return out
 
     def daily_bars(self, syms, n=260):
-        res = self.dc.market_data.get_batch_history_bar(syms, self.Cat.US_STOCK.name, self.TS.D.name, n)
+        res = self.paced(self.dc.market_data.get_batch_history_bar, syms, self.Cat.US_STOCK.name, self.TS.D.name, n)
         b = self.body(res) or {}
         out = {}
         for item in (b.get("result") or []):
@@ -222,6 +222,21 @@ class WB:
                 "l": [f(r.get("low")) for r in rows], "v": [f(r.get("volume"), 0) for r in rows]}
         return out
 
+    def paced(self, fn, *a):
+        """Webull rate-limits quote calls: keep >= 0.35 s between requests and back off on HTTP 429."""
+        for attempt in range(4):
+            wait = 0.35 - (time.time() - getattr(self, "_last_req", 0))
+            if wait > 0:
+                time.sleep(wait)
+            self._last_req = time.time()
+            try:
+                return fn(*a)
+            except Exception as e:
+                if "TOO_MANY_REQUESTS" in str(e) or "429" in str(e)[:40]:
+                    time.sleep(2 * (attempt + 1)); continue
+                raise
+        return fn(*a)
+
     def option_snapshots(self, occs):
         """Quotes for option symbols. Webull rejects a whole batch if ANY symbol isn't listed, so drop the bad ones and retry."""
         out = {}
@@ -231,7 +246,7 @@ class WB:
                 if not batch:
                     break
                 try:
-                    res = self.dc.option_market_data.get_option_snapshot(",".join(batch), self.Cat.US_OPTION.name)
+                    res = self.paced(self.dc.option_market_data.get_option_snapshot, ",".join(batch), self.Cat.US_OPTION.name)
                 except Exception as e:
                     msg = str(e)
                     if "INVALID_SYMBOL" not in msg:
@@ -1478,6 +1493,8 @@ class Bot:
                 row["label"] += " · max open"; continue
             if len(self.today_entries()) >= cfg["max_orders_per_day"]:
                 row["label"] += " · daily limit"; continue
+            if sum(1 for t in self.st["trades"] if t.get("kind") == "sr" and time.time() - t["created"] < 120) >= 2:
+                row["label"] += " · next cycle"; continue
             c, whyc = self.pick_sr(tk, m["price"], d)
             if not c:
                 row["label"] += " · skip: " + whyc; continue
