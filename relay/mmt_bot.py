@@ -1125,7 +1125,7 @@ class Bot:
 
     def pullback_entries(self, window):
         cfg = self.cfg; rows = []
-        n = now_et(); late = 915 <= n.hour * 60 + n.minute <= 950   # last ~45 min: today's price ≈ the close the signal uses
+        n = now_et(); late = self.cfg.get("dip_start_min", 915) <= n.hour * 60 + n.minute <= 950   # last ~45 min: today's price ≈ the close the signal uses
         for tk in CORE:
             m, ind = self.quotes.get(tk), self.ind.get(tk)
             row = {"t": tk, "m": m, "k": "none", "label": ""}
@@ -1223,8 +1223,8 @@ class Bot:
 
     def lotto_entries(self, window):
         cfg = self.cfg; rows = []
-        n = now_et(); late = 915 <= n.hour * 60 + n.minute <= 950
-        for tk in [x for x in CORE if x not in ("SPY", "QQQ")]:
+        n = now_et(); late = self.cfg.get("dip_start_min", 915) <= n.hour * 60 + n.minute <= 950
+        for tk in [x for x in (UNIVERSE if self.cfg.get("dip_all_tickers") else CORE) if x not in ("SPY", "QQQ")]:
             m, ind = self.quotes.get(tk), self.ind.get(tk)
             row = {"t": tk, "m": m, "k": "none", "label": ""}
             rows.append(row)
@@ -1242,7 +1242,7 @@ class Bot:
                 row["label"] = "Holding a ticket"; row["k"] = "held"; continue
             row["k"] = "go"; row["label"] = "DIP · RSI2 %.0f" % r2
             if not (window and late and cfg.get("lotto_enabled") and not STOP_F.exists()):
-                if cfg.get("lotto_enabled"): row["label"] += " (buys 3:15-3:50)"
+                if cfg.get("lotto_enabled"): row["label"] += " (buys %d:%02d-3:50)" % divmod(cfg.get("dip_start_min", 915) - 720, 60)
                 continue
             if len([t for t in self.st["trades"] if t.get("kind") == "lotto" and t["status"] in ("opening", "open", "closing")]) >= cfg["lotto_max_open"]:
                 row["label"] += " · max tickets open"; continue
@@ -1320,9 +1320,9 @@ class Bot:
 
     def call_entries(self, window):
         cfg = self.cfg; rows = []
-        n = now_et(); late = 915 <= n.hour * 60 + n.minute <= 950
+        n = now_et(); late = self.cfg.get("dip_start_min", 915) <= n.hour * 60 + n.minute <= 950
         vix = (self.pb or {}).get("vix")
-        for tk in [x for x in CORE if x not in ("SPY", "QQQ")]:
+        for tk in [x for x in (UNIVERSE if self.cfg.get("dip_all_tickers") else CORE) if x not in ("SPY", "QQQ")]:
             m, ind = self.quotes.get(tk), self.ind.get(tk)
             row = {"t": tk, "m": m, "k": "none", "label": ""}
             rows.append(row)
@@ -1339,7 +1339,7 @@ class Bot:
                 row["label"] = "In a position"; row["k"] = "held"; continue
             row["k"] = "go"; row["label"] = "DIP + FEAR · RSI2 %.0f" % r2
             if not (window and late and cfg.get("call_enabled") and not STOP_F.exists()):
-                if cfg.get("call_enabled"): row["label"] += " (buys 3:15-3:50)"
+                if cfg.get("call_enabled"): row["label"] += " (buys %d:%02d-3:50)" % divmod(cfg.get("dip_start_min", 915) - 720, 60)
                 continue
             if len([t for t in self.st["trades"] if t.get("kind") == "call" and t["status"] in ("opening", "open", "closing")]) >= cfg["call_max_open"]:
                 row["label"] += " · max open"; continue
@@ -1507,7 +1507,7 @@ class Bot:
                 row["label"] += " · max open"; continue
             if len(self.today_entries()) >= cfg["max_orders_per_day"]:
                 row["label"] += " · daily limit"; continue
-            if sum(1 for t in self.st["trades"] if t.get("kind") == "sr" and time.time() - t["created"] < 120) >= 2:
+            if sum(1 for t in self.st["trades"] if t.get("kind") == "sr" and time.time() - t["created"] < 120) >= self.cfg.get("sr_per_cycle", 2):
                 row["label"] += " · next cycle"; continue
             c, whyc = self.pick_sr(tk, m["price"], d)
             if not c:
