@@ -52,6 +52,47 @@ def http_get(url):
             return f.read().decode("utf-8", "ignore")
 
 
+LOG_F = BASE / "history_fetch.log"
+
+
+def log(msg):
+    print(msg, flush=True)
+    with open(LOG_F, "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
+
+
+def from_yf(sym):
+    """yfinance handles Yahoo's cookie/crumb + browser fingerprint checks that block plain requests."""
+    try:
+        import yfinance as yf
+    except Exception as e:
+        log("  yfinance not installed: %s" % e)
+        return None
+    try:
+        df = yf.Ticker(sym).history(period="max", interval="1d", auto_adjust=False, actions=True)
+        if df is None or len(df) < 300:
+            log("  yfinance %s: only %d rows" % (sym, 0 if df is None else len(df)))
+            return None
+        out = {"t": [], "c": [], "h": [], "l": [], "v": [], "splits": []}
+        for idx, row in df.iterrows():
+            c = row.get("Close")
+            if c is None or c != c:   # NaN
+                continue
+            d = idx.date().isoformat()
+            out["t"].append(d); out["c"].append(float(c))
+            h, l, v = row.get("High"), row.get("Low"), row.get("Volume")
+            out["h"].append(float(h) if h == h and h is not None else float(c))
+            out["l"].append(float(l) if l == l and l is not None else float(c))
+            out["v"].append(float(v) if v == v and v is not None else 0.0)
+            sp = row.get("Stock Splits")
+            if sp and sp == sp and float(sp) > 0:
+                out["splits"].append([d, float(sp)])
+        return out if len(out["c"]) > 300 else None
+    except Exception as e:
+        log("  yfinance %s: %s" % (sym, str(e)[:160]))
+        return None
+
+
 def from_yahoo(sym):
     q = sym.replace("^", "%5E")
     for host in ("query1", "query2"):
@@ -73,7 +114,7 @@ def from_yahoo(sym):
             if len(out["c"]) > 300:
                 return out
         except Exception as e:
-            print("  yahoo %s (%s): %s" % (sym, host, str(e)[:80]), flush=True)
+            log("  yahoo %s (%s): %s" % (sym, host, str(e)[:120]))
     return None
 
 
@@ -89,23 +130,25 @@ def from_stooq(sym):
                 out["v"].append(float(p[5]) if len(p) > 5 and p[5] else 0.0)
         return out if len(out["c"]) > 300 else None
     except Exception as e:
-        print("  stooq %s: %s" % (sym, str(e)[:80]), flush=True)
+        log("  stooq %s: %s" % (sym, str(e)[:120]))
         return None
 
 
 def fetch():
     have = json.loads(HIST_F.read_text()) if HIST_F.exists() else {}
+    LOG_F.write_text("fetch %s\n" % dt.datetime.now().isoformat(), encoding="utf-8")
     for sym in TICKERS + list(IVX.values()):
         if sym in have and have[sym]["t"][-1] >= (dt.date.today() - dt.timedelta(days=7)).isoformat():
             continue
-        b = from_yahoo(sym) or from_stooq(sym)
+        b = from_yf(sym) or from_yahoo(sym) or from_stooq(sym)
         if b:
             have[sym] = b
             print("bars %-6s %s → %s (%d days)" % (sym, b["t"][0], b["t"][-1], len(b["c"])), flush=True)
         else:
-            print("bars %-6s FAILED" % sym, flush=True)
+            log("bars %-6s FAILED" % sym)
         time.sleep(0.6)
-    HIST_F.write_text(json.dumps(have))
+    if have:
+        HIST_F.write_text(json.dumps(have))
     return have
 
 
