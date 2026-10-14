@@ -45,7 +45,7 @@ if (-not (Test-Path '.venv\Scripts\python.exe')) {
 }
 $vpy = Join-Path $relay '.venv\Scripts\python.exe'
 & $vpy -m pip install -q --upgrade pip 2>&1 | Out-Null
-& $vpy -m pip install -q --upgrade webull-openapi-python-sdk tzdata
+& $vpy -m pip install -q --upgrade webull-openapi-python-sdk tzdata yfinance
 if ($LASTEXITCODE -ne 0) { & $vpy -m pip install -q "git+https://github.com/webull-inc/webull-openapi-python-sdk" tzdata }
 
 # 4) Accounts + account ID

@@ -70,6 +70,8 @@ DEFAULTS = {
     "spread_ladder": 2,        # max open spreads per ticker
     "spread_spacing_days": 7,  # at most one new spread per ticker per week
     "spread_max_rsi": 70,      # skip bull puts when RSI is above this
+    "playbook": True,          # market read: credit spreads only when SPY > 200-day; dip-buys only when VIX >= pullback_min_vix
+    "pullback_min_vix": 20,    # 33-yr test: dip-buys made money when fear was up, ~flat in calm markets
     "spread_max_hv": 25,       # skip new spreads when 20-day vol > 25% (crash conditions; 33-yr test: +1%/yr)
     "spread_both_sides": True, # bear call spreads in downtrends
     "spread_min_credit_pct": 20,  # credit must be ≥ 20% of width
@@ -506,6 +508,7 @@ class Bot:
         self.st = load_json(STATE_F, None) or {"trades": [], "log": [], "exp_field": None, "created": time.time()}
         self.quotes, self.ind, self.sigs, self.regime = {}, {}, [], {"k": "unknown", "why": []}
         self.last_tick = None; self.err = None; self.spread_sigs = []; self.pb_sigs = []; self.closes = {}
+        self.vix = (0, None, ""); self.pb = {}; self.pb_label = None
 
     # data
     def refresh_bars(self):
@@ -543,6 +546,37 @@ class Bot:
         if i["vr"] >= 80: pts += 1; why.append("SPY volatility near 1-year high")
         k = "off" if pts >= 3 else "caution" if pts >= 1 else "on"
         return {"k": k, "why": why or ["SPY above 50/200-day, volatility normal"]}
+
+    def get_vix(self):
+        """VIX from Yahoo via yfinance (refreshed every 15 min); fallback: SPY 20-day vol + 4."""
+        ts, v, src = self.vix
+        if v and time.time() - ts < 900:
+            return v, src
+        try:
+            import yfinance as yf
+            hist = yf.Ticker("^VIX").history(period="5d", interval="1d")
+            v = float(hist["Close"].dropna().iloc[-1]); src = "VIX"
+        except Exception:
+            i = self.ind.get("SPY")
+            v = (i["hv"] + 4) if i and i.get("hv") else None; src = "est. from SPY volatility"
+        self.vix = (time.time(), v, src)
+        return v, src
+
+    def playbook(self):
+        """Read the market once per cycle and decide which strategies are allowed."""
+        cfg = self.cfg; spy, i = self.quotes.get("SPY"), self.ind.get("SPY")
+        bull = bool(spy and i and i.get("sma200") and spy["price"] > i["sma200"])
+        vix, src = self.get_vix()
+        on = cfg.get("playbook", True)
+        credit_on = bull or not on
+        dip_on = (vix is not None and vix >= cfg.get("pullback_min_vix", 20)) or not on
+        mood = "unknown" if vix is None else "calm" if vix < 15 else "normal" if vix < 20 else "nervous" if vix < 30 else "panic"
+        label = "%s market · VIX %s (%s) → credit spreads %s · dip-buys %s" % (
+            "Bull" if bull else "Bear", "%.0f" % vix if vix else "?", mood, "ON" if credit_on else "OFF", "ON" if dip_on else "waiting for fear (VIX ≥ %d)" % cfg.get("pullback_min_vix", 20))
+        self.pb = {"bull": bull, "vix": vix, "src": src, "mood": mood, "credit_on": credit_on, "dip_on": dip_on, "label": label}
+        if label != self.pb_label and spy:
+            say("🧭 Market read: " + label, self.st); self.pb_label = label
+        return self.pb
 
     # helpers
     def open_trades(self, spreads=True):
@@ -824,6 +858,8 @@ class Bot:
                 row["label"] = "waiting for data"; continue
             tr = trend_of(ind, m["price"])
             row["trend"] = tr
+            if self.pb and not self.pb.get("credit_on", True):
+                row["label"] = "Market below 200-day — credit spreads off (playbook)"; continue
             if tr == "up":
                 right = "P"
             elif tr == "down" and cfg["spread_both_sides"]:
@@ -964,6 +1000,8 @@ class Bot:
                 row["label"] = "No dip (RSI2 %.0f)" % (r2 or 0); continue
             if any(t["ticker"] == tk and t.get("kind") == "debit" and t["status"] in ("opening", "open", "closing") for t in self.st["trades"]):
                 row["label"] = "In a position"; row["k"] = "held"; continue
+            if self.pb and not self.pb.get("dip_on", True):
+                row["label"] = "Dip (RSI2 %.0f) but market calm — VIX %s < %d, skip" % (r2, "%.0f" % self.pb["vix"] if self.pb.get("vix") else "?", cfg.get("pullback_min_vix", 20)); continue
             row["k"] = "go"; row["label"] = "DIP · RSI2 %.0f" % r2
             if not (window and late and cfg.get("pullback_enabled") and not STOP_F.exists()):
                 if cfg.get("pullback_enabled"): row["label"] += " (buys 3:15–3:50)"
@@ -1062,6 +1100,7 @@ class Bot:
             self.refresh_bars()
             self.refresh_quotes()
             self.regime = self.regime_of()
+            self.playbook()
             fresh = any(time.time() - q["ts"] < 20 * 60 for q in self.quotes.values()) if market else False
             if market and not fresh:
                 say("Quotes look stale (holiday/halt?) — no trading this cycle", self.st)
@@ -1134,6 +1173,8 @@ def write_html(bot):
             cfg["spread_width"], cfg["spread_delta"], cfg["spread_dte"], cfg["spread_tp_pct"], cfg["spread_exit_dte"]))
     elif mode != "buy":
         h.append("<div class='c' style='border-color:#818cf8;color:#c7d2fe'>👀 WATCH MODE — signals only, no new orders. Open positions are still managed.</div>")
+    if bot.pb:
+        h.append("<div class='c' style='border-color:#0ea5e9;color:#7dd3fc'>🧭 %s%s</div>" % (esc(bot.pb["label"]), "" if bot.pb.get("src") == "VIX" else " <span class=m>(VIX %s)</span>" % esc(bot.pb.get("src", ""))))
     if bot.err:
         h.append("<div class='c' style='border-color:#ef4444;color:#f87171'>Last error: %s</div>" % esc(bot.err))
     eq = bot.equity()

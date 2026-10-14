@@ -31,7 +31,7 @@ echo "Setting up Python (first run takes a minute)…"
 [ -d .venv ] || python3 -m venv .venv || { echo "Couldn't create Python env."; read -r -p "Press Enter to close"; exit 1; }
 source .venv/bin/activate
 pip install -q --upgrade pip >/dev/null 2>&1
-pip install -q --upgrade webull-openapi-python-sdk 2>/dev/null || pip install -q "git+https://github.com/webull-inc/webull-openapi-python-sdk"
+pip install -q --upgrade webull-openapi-python-sdk yfinance 2>/dev/null || pip install -q "git+https://github.com/webull-inc/webull-openapi-python-sdk"
 source "$KEYFILE"
 echo
 echo "=== Your Webull paper accounts ==="
