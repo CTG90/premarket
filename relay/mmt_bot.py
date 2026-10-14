@@ -488,11 +488,16 @@ def opt_px(q):
     return bid, ask, mid
 
 
+def opt_tick(px):
+    """Option price increments: $0.05 steps at $3.00 and up, $0.01 below."""
+    return round(round(px / 0.05) * 0.05, 2) if px >= 3 else round(px, 2)
+
+
 def build_order(o, side, qty, limit, exp_field):
     leg = {"side": side, "quantity": str(qty), "symbol": o["ticker"], "strike_price": ("%g" % o["strike"]),
            exp_field: o["exp"], "instrument_type": "OPTION", "option_type": "CALL" if o["dir"] == "C" else "PUT", "market": "US"}
     return {"client_order_id": uuid.uuid4().hex, "combo_type": "NORMAL", "order_type": "LIMIT", "quantity": str(qty),
-            "limit_price": "%.2f" % limit, "option_strategy": "SINGLE", "side": side, "time_in_force": "DAY",
+            "limit_price": "%.2f" % opt_tick(limit), "option_strategy": "SINGLE", "side": side, "time_in_force": "DAY",
             "entrust_type": "QTY", "legs": [leg]}
 
 
@@ -919,7 +924,7 @@ class Bot:
         return {"client_order_id": uuid.uuid4().hex, "combo_type": "NORMAL", "option_strategy": "VERTICAL",
                 "order_type": "LIMIT", "side": legs[0]["side"], "time_in_force": "DAY", "entrust_type": "QTY",
                 "instrument_type": "OPTION", "market": "US", "symbol": t["ticker"], "quantity": str(t["qty"]),
-                "limit_price": "%.2f" % limit, "legs": legs}
+                "limit_price": "%.2f" % opt_tick(limit), "legs": legs}
 
     def send_spread(self, order, label):
         code, body = self.wb.preview3(order)
