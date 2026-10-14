@@ -39,6 +39,7 @@ BASE = Path(__file__).resolve().parent
 ROOT = BASE.parent
 CFG_F, STATE_F, BARS_F, HTML_F = BASE / "bot_config.json", BASE / "bot_state.json", BASE / "bars_cache.json", BASE / "status.html"
 STOP_F = ROOT / "STOP"
+PATHS_F = BASE / "trade_paths.csv"
 ET = ZoneInfo("America/New_York")
 
 WATCH = ["SPY", "QQQ", "NVDA", "AAPL", "AMZN", "MSFT", "META", "TSLA", "AMD", "PLTR"]
@@ -699,6 +700,29 @@ class Bot:
                 pass
         cache[key] = pick
         return pick
+
+    def track_paths(self):
+        """Record every open trade's P&L each cycle: best/worst % (MFE/MAE) on the trade + a row in trade_paths.csv,
+        so the review can replay any exit rule (e.g. 'take profit at +25%') against what really happened."""
+        now = time.time(); rows = []
+        for t in self.st["trades"]:
+            if t["status"] not in ("open", "closing") or not t.get("mark"):
+                continue
+            p = pnl_pct(t)
+            if t.get("mfe") is None or p > t["mfe"]:
+                t["mfe"] = round(p, 1); t["mfe_at"] = now
+            if t.get("mae") is None or p < t["mae"]:
+                t["mae"] = round(p, 1); t["mae_at"] = now
+            for lvl in (25, 50, 100):
+                if p >= lvl and not t.get("hit_%d" % lvl):
+                    t["hit_%d" % lvl] = now
+            rows.append("%s,%s,%s,%s,%.4f,%.1f\n" % (dt.datetime.fromtimestamp(now, ET).strftime("%Y-%m-%d %H:%M"), t["id"], t.get("kind"), t["occ"], t["mark"]["px"], p))
+        if rows:
+            new = not PATHS_F.exists()
+            with open(PATHS_F, "a", encoding="utf-8") as fh:
+                if new:
+                    fh.write("time,trade_id,strategy,contract,mark,pnl_pct\n")
+                fh.writelines(rows)
 
     def chase(self, kind, tk):
         """Fraction of the way from mid to the far side to price an entry: 0.5, then 0.75, then 1.0 after unfilled tries today."""
@@ -1654,6 +1678,10 @@ class Bot:
                     self.err = "%s: %s" % (type(e).__name__, str(e).splitlines()[0][:200] if str(e) else "")
                     say("ERROR " + self.err, self.st)
                     traceback.print_exc()
+            try:
+                self.track_paths()
+            except Exception as e:
+                say("path log error: %s" % e, self.st)
             if market and fresh and mins >= 930:
                 try:
                     self.log_iv()
@@ -1747,6 +1775,8 @@ def write_html(bot):
         for t in opn:
             mk = (t.get("mark") or {}).get("px")
             info = ("score %d" % t["score"]) if t.get("score") is not None else ("simulated · no orders" if str(t.get("kind", "")).startswith("etf") else ("credit $%.2f · max loss $%.0f" % (t["entry"]["px"], t.get("max_loss", 0))) if t.get("kind") == "spread" else ("paid $%.2f · max loss $%.0f" % (t["entry"]["px"], t.get("max_loss", 0))))
+            if t.get("mfe") is not None:
+                info += " · best %+.0f%% / worst %+.0f%%" % (t["mfe"], t["mae"])
             h.append("<tr><td><b>%s</b><div class=m>%s · %s · %d DTE</div></td><td>%s</td><td>$%.2f</td><td>%s</td><td class=%s>%+.0f%%<div class=m>%+.0f$</div></td></tr>" % (
                 esc(t["occ"]), esc(t["play"]), info, max(0, dte(t["exp"])), t["status"], t["entry"]["px"],
                 "$%.2f" % mk if mk else "--", "up" if pnl(t) >= 0 else "dn", pnl_pct(t), pnl(t)))

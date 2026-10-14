@@ -28,3 +28,4 @@ relay/hist_bars.json
 relay/history_report.txt
 relay/intraday_bars.json
 relay/intraday_report.txt
+relay/trade_paths.csv
