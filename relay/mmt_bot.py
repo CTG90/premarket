@@ -41,7 +41,9 @@ STOP_F = ROOT / "STOP"
 ET = ZoneInfo("America/New_York")
 
 WATCH = ["SPY", "QQQ", "NVDA", "AAPL", "AMZN", "MSFT", "META", "TSLA", "AMD", "PLTR"]
-UNIVERSE = WATCH + ["GOOGL", "NFLX", "AVGO"]
+CORE = WATCH + ["GOOGL", "NFLX", "AVGO"]          # the 13 names every backtest used
+EXTRA = ["MU", "INTC", "ORCL", "CRM", "UBER", "COIN", "SHOP", "BA", "JPM", "XOM", "DIS", "SOFI", "ARM", "SMCI", "MSTR"]
+UNIVERSE = CORE + EXTRA                               # S/R sleeve scans all of these; proven strategies stay on CORE
 IV_LOG = Path(__file__).resolve().parent / "iv_log.csv"
 NAMES = {"SPY": "S&P 500 ETF", "QQQ": "Nasdaq ETF", "NVDA": "Nvidia", "AAPL": "Apple", "AMZN": "Amazon",
          "MSFT": "Microsoft", "META": "Meta", "TSLA": "Tesla", "AMD": "AMD", "PLTR": "Palantir"}
@@ -64,7 +66,7 @@ DEFAULTS = {
     "lotto_max_spread_pct": 25,
     "pullback_enabled": True,     # call debit spreads on dips (own sleeve)
     # every proven strategy runs in its own sleeve: separate starting balance, sizing and scorecard
-    "sleeves": {"spread": 2500, "lotto": 2500, "debit": 2500, "call": 10000, "etf_trend": 2500, "etf_dip": 2500},
+    "sleeves": {"spread": 2500, "lotto": 2500, "debit": 2500, "call": 10000, "etf_trend": 2500, "etf_dip": 2500, "sr": 10000},
     "call_enabled": True,         # single ATM call on a dip when VIX >= call_min_vix (33-yr test: ~+15%/trade on stocks)
     "call_min_vix": 20,
     "call_dte": 45,
@@ -74,7 +76,17 @@ DEFAULTS = {
     "call_max_open": 3,
     "etf_trend_enabled": True,    # 3x S&P (UPRO-style) when SPY > 200-day +3%, cash when < 200-day -3% (simulated, no orders)
     "etf_dip_enabled": True,      # 3x S&P on SPY RSI2 < 10 above 200-day, out when SPY closes above its 5-day avg (simulated)
-    "etf_lev": 3,     # uptrend + RSI(2) dip → call debit spread (cheap version of a pullback call)
+    "etf_lev": 3,
+    "sr_enabled": True,           # support/resistance swing trades (UNPROVEN: 33-yr daily test showed no edge vs random)
+    "sr_delta": 0.40,             # slightly OTM call/put
+    "sr_dte": 21,
+    "sr_tp_pct": 60,
+    "sr_stop_pct": 40,
+    "sr_max_hold_days": 10,
+    "sr_risk_pct": 5,
+    "sr_max_open": 5,
+    "sr_near_pct": 0.5,           # "at the level" = within 0.5%
+    "sr_min_rvol": 1.2,           # relative volume needed (1.5 for breakouts/breakdowns)     # uptrend + RSI(2) dip → call debit spread (cheap version of a pullback call)
     "pullback_rsi2": 5,           # backtest: RSI2<5 beat <10 on both halves of the data
     "pullback_dte": 45,
     "pullback_tp_pct": 50,        # close at +50% on the debit (best in debittest, Oct 13)
@@ -530,13 +542,19 @@ class Bot:
         self.quotes, self.ind, self.sigs, self.regime = {}, {}, [], {"k": "unknown", "why": []}
         self.last_tick = None; self.err = None; self.spread_sigs = []; self.pb_sigs = []; self.closes = {}
         self.vix = (0, None, ""); self.pb = {}; self.pb_label = None; self.lotto_sigs = []; self.call_sigs = []
+        self.bars = {}; self.day_hl = {}; self.levels = {}; self.levels_day = None; self.sr_sigs = []
 
     # data
     def refresh_bars(self):
         cache = load_json(BARS_F, {})
         today = now_et().date().isoformat()
         if cache.get("d") != today or set(cache.get("bars", {})) < set(UNIVERSE):
-            bars = self.wb.daily_bars(UNIVERSE)
+            bars = {}
+            for i in range(0, len(UNIVERSE), 10):
+                try:
+                    bars.update(self.wb.daily_bars(UNIVERSE[i:i + 10]))
+                except Exception as e:
+                    say("bars chunk failed (%s): %s" % (",".join(UNIVERSE[i:i + 10]), str(e)[:80]), self.st)
             if bars:
                 cache = {"d": today, "bars": bars}
                 save_json(BARS_F, cache)
@@ -546,15 +564,27 @@ class Bot:
                 B = {k: v[:-1] for k, v in B.items()}
             self.ind[t] = indicators(B)
             self.closes[t] = B["c"]
+            self.bars[t] = B
 
     def refresh_quotes(self):
-        raw = self.wb.snapshot(UNIVERSE)
+        raw = {}
+        for i in range(0, len(UNIVERSE), 10):
+            try:
+                raw.update(self.wb.snapshot(UNIVERSE[i:i + 10]))
+            except Exception as e:
+                say("quote chunk failed: %s" % str(e)[:80], self.st)
         q = {}
         for t, r in raw.items():
             p, pc = f(r.get("price")), f(r.get("pre_close"))
             if p and pc:
                 q[t] = {"ticker": t, "price": p, "prev": pc, "pct": (p - pc) / pc * 100, "vol": f(r.get("volume"), 0),
-                        "bid": f(r.get("bid")), "ask": f(r.get("ask")), "ts": (f(r.get("last_trade_time"), 0) or 0) / 1000}
+                        "bid": f(r.get("bid")), "ask": f(r.get("ask")), "ts": (f(r.get("last_trade_time"), 0) or 0) / 1000,
+                        "high": f(r.get("high")), "low": f(r.get("low")), "open": f(r.get("open"))}
+                # track the day's range ourselves too (in case the snapshot has no high/low)
+                d = now_et().date().isoformat(); hl = self.day_hl.get(t)
+                if not hl or hl["d"] != d:
+                    hl = self.day_hl[t] = {"d": d, "hi": p, "lo": p}
+                hl["hi"] = max(hl["hi"], p, q[t]["high"] or p); hl["lo"] = min(hl["lo"], p, q[t]["low"] or p)
         self.quotes = q
 
     def regime_of(self):
@@ -680,7 +710,7 @@ class Bot:
     # exits
     def manage_exits(self, opts, trading):
         cfg = self.cfg
-        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") not in ("spread", "debit", "lotto", "call", "etf_trend", "etf_dip")]:
+        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") not in ("spread", "debit", "lotto", "call", "etf_trend", "etf_dip", "sr")]:
             q = opts.get(t["occ"])
             if q:
                 bid, ask, mid = opt_px(q)
@@ -801,7 +831,7 @@ class Bot:
 
     def open_risk(self, kind=None):
         return sum(t.get("max_loss", 0) for t in self.st["trades"]
-                   if t["status"] in ("opening", "open", "closing") and (t.get("kind") == kind if kind else t.get("kind") in ("spread", "debit", "lotto", "call")))
+                   if t["status"] in ("opening", "open", "closing") and (t.get("kind") == kind if kind else t.get("kind") in ("spread", "debit", "lotto", "call", "sr")))
 
     def spread_qty(self):
         cfg = self.cfg
@@ -1016,7 +1046,7 @@ class Bot:
     def pullback_entries(self, window):
         cfg = self.cfg; rows = []
         n = now_et(); late = 915 <= n.hour * 60 + n.minute <= 950   # last ~45 min: today's price ≈ the close the signal uses
-        for tk in UNIVERSE:
+        for tk in CORE:
             m, ind = self.quotes.get(tk), self.ind.get(tk)
             row = {"t": tk, "m": m, "k": "none", "label": ""}
             rows.append(row)
@@ -1114,7 +1144,7 @@ class Bot:
     def lotto_entries(self, window):
         cfg = self.cfg; rows = []
         n = now_et(); late = 915 <= n.hour * 60 + n.minute <= 950
-        for tk in [x for x in UNIVERSE if x not in ("SPY", "QQQ")]:
+        for tk in [x for x in CORE if x not in ("SPY", "QQQ")]:
             m, ind = self.quotes.get(tk), self.ind.get(tk)
             row = {"t": tk, "m": m, "k": "none", "label": ""}
             rows.append(row)
@@ -1212,7 +1242,7 @@ class Bot:
         cfg = self.cfg; rows = []
         n = now_et(); late = 915 <= n.hour * 60 + n.minute <= 950
         vix = (self.pb or {}).get("vix")
-        for tk in [x for x in UNIVERSE if x not in ("SPY", "QQQ")]:
+        for tk in [x for x in CORE if x not in ("SPY", "QQQ")]:
             m, ind = self.quotes.get(tk), self.ind.get(tk)
             row = {"t": tk, "m": m, "k": "none", "label": ""}
             rows.append(row)
@@ -1298,12 +1328,175 @@ class Bot:
             elif e["in"] and t:
                 t["exp"] = today
 
+    # -- support / resistance swing trades (calls and puts) --
+    def build_levels(self):
+        """Once a day after the open: chart pivots (120 days), premarket high/low (yfinance), and option open-interest walls."""
+        today = now_et().date().isoformat()
+        if self.levels_day == today:
+            return
+        self.levels_day = today; pm = {}
+        try:
+            import yfinance as yf
+            for tk in UNIVERSE:
+                try:
+                    df = yf.Ticker(tk).history(period="1d", interval="5m", prepost=True)
+                    pre = [r for idx, r in df.iterrows() if idx.tz_convert("America/New_York").strftime("%H:%M") < "09:30"]
+                    if pre:
+                        pm[tk] = (max(float(r["High"]) for r in pre), min(float(r["Low"]) for r in pre), sum(float(r["Volume"] or 0) for r in pre))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        for tk in UNIVERSE:
+            B = self.bars.get(tk); m = self.quotes.get(tk)
+            if not B or not m or len(B["h"]) < 60:
+                continue
+            h, l, K = B["h"][-120:], B["l"][-120:], 5
+            piv_h = [h[j] for j in range(K, len(h) - K) if h[j] == max(h[j - K:j + K + 1])]
+            piv_l = [l[j] for j in range(K, len(l) - K) if l[j] == min(l[j - K:j + K + 1])]
+            lv = {"res": piv_h + [B["h"][-1]], "sup": piv_l + [B["l"][-1]], "src": {}}
+            for x in piv_h: lv["src"][round(x, 2)] = "swing high"
+            for x in piv_l: lv["src"][round(x, 2)] = "swing low"
+            lv["src"][round(B["h"][-1], 2)] = "yesterday high"; lv["src"][round(B["l"][-1], 2)] = "yesterday low"
+            if tk in pm:
+                lv["res"].append(pm[tk][0]); lv["sup"].append(pm[tk][1]); lv["pm_vol"] = pm[tk][2]
+                lv["src"][round(pm[tk][0], 2)] = "premarket high"; lv["src"][round(pm[tk][1], 2)] = "premarket low"
+            # open-interest walls: biggest call OI above / put OI below, nearest weekly >= 5 days out
+            try:
+                iso = friday_at_least(5); S = m["price"]; st = strike_step(S); k0 = round_strike(S)
+                ks = [k0 + st * i for i in range(-8, 9)]
+                occs = [occ(tk, iso, r, k) for k in ks for r in ("C", "P")]
+                sn = self.wb.option_snapshots(occs)
+                calls = [(f(sn.get(occ(tk, iso, "C", k), {}).get("open_interest"), 0), k) for k in ks if k > S]
+                puts = [(f(sn.get(occ(tk, iso, "P", k), {}).get("open_interest"), 0), k) for k in ks if k < S]
+                if calls and max(calls)[0] > 0:
+                    cw = max(calls)[1]; lv["res"].append(cw); lv["src"][round(cw, 2)] = "call OI wall (%d)" % max(calls)[0]; lv["call_wall"] = cw
+                if puts and max(puts)[0] > 0:
+                    pw = max(puts)[1]; lv["sup"].append(pw); lv["src"][round(pw, 2)] = "put OI wall (%d)" % max(puts)[0]; lv["put_wall"] = pw
+            except Exception:
+                pass
+            self.levels[tk] = lv
+
+    def rvol(self, tk):
+        m, ind = self.quotes.get(tk), self.ind.get(tk)
+        if not (m and ind and ind.get("avg_vol")):
+            return None
+        n = now_et(); frac = min(1.0, max(0.08, (n.hour * 60 + n.minute - 570) / 390))
+        return m["vol"] / (ind["avg_vol"] * frac) if ind["avg_vol"] else None
+
+    def sr_setup(self, tk):
+        """Returns (dir, setup, level, why) or (None, label)."""
+        cfg = self.cfg; m, ind, lv = self.quotes.get(tk), self.ind.get(tk), self.levels.get(tk)
+        if not (m and ind and lv and ind.get("sma50")):
+            return None, "waiting for levels"
+        S = m["price"]; hl = self.day_hl.get(tk) or {"hi": S, "lo": S}; near = cfg["sr_near_pct"] / 100
+        sup = max([x for x in lv["sup"] if x < S * 1.002] or [0]); res = min([x for x in lv["res"] if x > S * 0.998] or [0]) or None
+        rv = self.rvol(tk) or 0; up = S > ind["sma50"]
+        name = lambda x: lv["src"].get(round(x, 2), "level")
+        # breakout: today's price cleared yesterday's resistance band with volume
+        broke = [x for x in lv["res"] if hl["lo"] < x < S * (1 - 0.003)]
+        if broke and rv >= 1.5 and up:
+            x = max(broke); return ("C", "Breakout", x, "above %s $%.2f · rvol %.1f" % (name(x), x, rv))
+        lost = [x for x in lv["sup"] if hl["hi"] > x > S * (1 + 0.003)]
+        if lost and rv >= 1.5 and not up:
+            x = min(lost); return ("P", "Breakdown", x, "below %s $%.2f · rvol %.1f" % (name(x), x, rv))
+        if sup and hl["lo"] <= sup * (1 + near) and S > sup * 1.003 and rv >= cfg["sr_min_rvol"] and up:
+            return ("C", "Support bounce", sup, "held %s $%.2f · rvol %.1f" % (name(sup), sup, rv))
+        if res and hl["hi"] >= res * (1 - near) and S < res * 0.997 and rv >= cfg["sr_min_rvol"] and not up:
+            return ("P", "Resistance reject", res, "rejected at %s $%.2f · rvol %.1f" % (name(res), res, rv))
+        return None, "S $%.2f / R %s · rvol %.1f" % (sup, ("$%.2f" % res) if res else "--", rv)
+
+    def sr_entries(self, window):
+        cfg = self.cfg; rows = []
+        n = now_et(); mins = n.hour * 60 + n.minute
+        if mins >= 580:
+            self.build_levels()
+        for tk in [x for x in UNIVERSE if x not in ("SPY", "QQQ")]:
+            m = self.quotes.get(tk); row = {"t": tk, "m": m, "k": "none", "label": ""}; rows.append(row)
+            r = self.sr_setup(tk)
+            if r[0] is None:
+                row["label"] = r[1]; continue
+            d, setup, lvl, why = r; row["k"] = "go"; row["label"] = "%s %s · %s" % (setup, "CALL" if d == "C" else "PUT", why)
+            if any(t["ticker"] == tk and t.get("kind") == "sr" and t["status"] in ("opening", "open", "closing") for t in self.st["trades"]):
+                row["label"] = "In a position"; row["k"] = "held"; continue
+            if not (window and 600 <= mins <= 930 and cfg.get("sr_enabled") and not STOP_F.exists()):
+                continue
+            if any(t["ticker"] == tk and t.get("kind") == "sr" for t in self.today_entries()):
+                row["label"] += " · traded today"; continue
+            if len([t for t in self.st["trades"] if t.get("kind") == "sr" and t["status"] in ("opening", "open", "closing")]) >= cfg["sr_max_open"]:
+                row["label"] += " · max open"; continue
+            if len(self.today_entries()) >= cfg["max_orders_per_day"]:
+                row["label"] += " · daily limit"; continue
+            c, whyc = self.pick_sr(tk, m["price"], d)
+            if not c:
+                row["label"] += " · skip: " + whyc; continue
+            limit = round(c["mid"] + (c["ask"] - c["mid"]) * 0.5, 2)
+            t = {"id": uuid.uuid4().hex[:10], "kind": "sr", "ticker": tk, "dir": d, "strike": c["strike"], "exp": c["exp"], "occ": c["occ"],
+                 "qty": c["qty"], "play": "S/R " + setup, "score": None, "feat": {"level": round(lvl, 2), "why": why},
+                 "created": time.time(), "entry": {"px": limit, "und": m["price"], "at": time.time(), "iv": c["iv"], "spread": c["spread"]},
+                 "level": lvl, "max_loss": limit * 100 * c["qty"], "status": "opening"}
+            coid, _ = self.send(self.build(t, "BUY", limit), "open " + c["occ"])
+            if coid:
+                t["open_order"] = {"coid": coid, "at": time.time(), "limit": limit}
+                self.st["trades"].append(t); row["k"] = "held"; row["label"] = "Order sent · " + setup
+                say("📐 BUY %dx %s @ $%.2f · S/R %s %s · %s" % (t["qty"], c["occ"], limit, setup, "call" if d == "C" else "put", why), self.st)
+        self.sr_sigs = rows
+
+    def pick_sr(self, tk, S, d):
+        cfg = self.cfg; iso = friday_at_least(cfg["sr_dte"]); st = strike_step(S); k0 = round_strike(S)
+        ks = [k0 + st * i for i in range(0, 7)] if d == "C" else [k0 - st * i for i in range(0, 7)]
+        sn = self.wb.option_snapshots([occ(tk, iso, d, k) for k in ks]); best = None; why = "no quotes"
+        for k in ks:
+            q = sn.get(occ(tk, iso, d, k))
+            if not q: continue
+            bid, ask, mid = opt_px(q); dl = f(q.get("delta"))
+            if not (bid and ask and mid): why = "no bid/ask"; continue
+            if dl is None: dl = 0.5 * math.exp(-abs(k / S - 1) * 12)
+            sp = (ask - bid) / mid * 100; oi = f(q.get("open_interest"), 0)
+            if sp > 15: why = "spread %.0f%%" % sp; continue
+            if oi < 200: why = "open interest %d" % oi; continue
+            sc = abs(abs(dl) - cfg["sr_delta"])
+            if best is None or sc < best[0]:
+                best = (sc, {"strike": k, "occ": occ(tk, iso, d, k), "exp": iso, "bid": bid, "ask": ask, "mid": mid, "spread": sp, "iv": f(q.get("imp_vol"))})
+        if not best: return None, why
+        c = best[1]; budget = self.equity("sr") * cfg["sr_risk_pct"] / 100
+        c["qty"] = max(1, int(budget // (c["ask"] * 100)))
+        if c["ask"] * 100 > budget * 2: return None, "1 contract $%.0f > 2x budget $%.0f" % (c["ask"] * 100, budget)
+        if self.open_risk("sr") + c["ask"] * 100 * c["qty"] > self.equity("sr") * 0.4: return None, "sleeve risk cap"
+        return c, None
+
+    def manage_sr(self, opts, trading):
+        cfg = self.cfg
+        for t in [x for x in self.st["trades"] if x["status"] == "open" and x.get("kind") == "sr"]:
+            q = opts.get(t["occ"])
+            if q:
+                bid, ask, mid = opt_px(q)
+                t["mark"] = {"px": bid or mid, "mid": mid, "at": time.time(), "iv": f(q.get("imp_vol")), "delta": f(q.get("delta"))}
+            if not trading or not q:
+                continue
+            bid, ask, mid = opt_px(q); g = ((bid or mid) / t["entry"]["px"] - 1) * 100 if t["entry"]["px"] else 0
+            held = (time.time() - t["entry"]["at"]) / 86400; S = (self.quotes.get(t["ticker"]) or {}).get("price"); reason = None
+            if g >= cfg["sr_tp_pct"]: reason = "Take profit +%d%%" % cfg["sr_tp_pct"]
+            elif g <= -cfg["sr_stop_pct"]: reason = "Stop -%d%%" % cfg["sr_stop_pct"]
+            elif S and t.get("level") and ((t["dir"] == "C" and S < t["level"] * 0.99) or (t["dir"] == "P" and S > t["level"] * 1.01)):
+                reason = "Level failed"
+            elif held >= cfg["sr_max_hold_days"]: reason = "Time exit (%d days)" % held
+            elif dte(t["exp"]) <= 5: reason = "Expiry exit"
+            if not reason:
+                continue
+            limit = max(0.01, round(mid - (ask - bid) * 0.25, 2)) if bid and ask else max(0.01, round(bid or mid, 2))
+            coid, _ = self.send(self.build(t, "SELL", limit), "close " + t["occ"])
+            if coid:
+                t["close_order"] = {"coid": coid, "at": time.time(), "limit": limit, "reason": reason}
+                t["status"] = "closing"
+                say("📤 SELL %s x%d @ $%.2f · %s" % (t["occ"], t["qty"], limit, reason), self.st)
+
     def log_iv(self):
         n = now_et(); today = n.date().isoformat()
         if not self.cfg.get("iv_log") or self.st.get("iv_logged") == today:
             return
         rows = []
-        for tk in UNIVERSE:
+        for tk in CORE:
             m = self.quotes.get(tk)
             if not m:
                 continue
@@ -1355,11 +1548,13 @@ class Bot:
             self.manage_debits(market and fresh)
             self.manage_lotto(opts, market and fresh)
             self.manage_calls(opts, market and fresh)
+            self.manage_sr(opts, market and fresh)
             self.entries(window and fresh)
             self.spread_entries(window and fresh)
             self.pullback_entries(window and fresh)
             self.lotto_entries(window and fresh)
             self.call_entries(window and fresh)
+            self.sr_entries(window and fresh)
             self.etf_sims(market, fresh)
             if market and fresh and mins >= 930:
                 try:
@@ -1434,9 +1629,10 @@ def write_html(bot):
     h.append("<div class=m>%s</div>" % esc(" · ".join(reg["why"])))
     TARGET = {"spread": "~75% win · +4-6%/trade", "lotto": "~20% win · 1 in 8 hits 5.8x · avg +30-50%",
               "debit": "~57% win · +6-10%/trade", "call": "~58% win · ~+15%/trade",
-              "etf_trend": "~17%/yr · drops up to 50%", "etf_dip": "~12-20%/yr"}
+              "etf_trend": "~17%/yr · drops up to 50%", "etf_dip": "~12-20%/yr",
+              "sr": "UNPROVEN · daily test: no edge vs random"}
     NAME = {"spread": "Credit spreads", "lotto": "🎰 Lotto calls", "debit": "Dip call spreads", "call": "Dip single calls (VIX 20+)",
-            "etf_trend": "3x S&P trend (sim)", "etf_dip": "3x S&P dip (sim)"}
+            "etf_trend": "3x S&P trend (sim)", "etf_dip": "3x S&P dip (sim)", "sr": "📐 Support/resistance (test)"}
     h.append("<h2>Strategy scorecard</h2><div class=c><table><tr><th>Strategy</th><th>Balance</th><th>Closed</th><th>Win</th><th>P&amp;L</th><th>Backtest target</th></tr>")
     for k in (cfg.get("sleeves") or {}):
         cl = [t for t in st["trades"] if t.get("kind") == k and t["status"] == "closed"]
@@ -1470,6 +1666,11 @@ def write_html(bot):
         h.append("<tr><td><b>%s</b></td><td>%s</td><td>%s</td><td><span class='chip %s'>%s</span></td></tr>" % (
             r["t"], ("$%.2f" % m["price"]) if m else "--", ("%.0f" % r["rsi2"]) if r.get("rsi2") is not None else "--",
             "g" if r["k"] in ("go", "held") else "", esc(r["label"])))
+    h.append("</table></div><h2>📐 Support / resistance · chart levels + premarket high/low + OI walls · volume-confirmed · UNPROVEN</h2><div class=c><table><tr><th>Ticker</th><th>Price</th><th>Status</th></tr>")
+    for r in sorted(bot.sr_sigs, key=lambda r: (r["k"] not in ("go", "held"), r["t"])):
+        m = r.get("m")
+        h.append("<tr><td><b>%s</b></td><td>%s</td><td><span class='chip %s'>%s</span></td></tr>" % (
+            r["t"], ("$%.2f" % m["price"]) if m else "--", "g" if r["k"] in ("go", "held") else "", esc(r["label"])))
     h.append("</table></div><h2>Dip single calls · ATM, 45 days · only when VIX " + "%d+" % cfg.get("call_min_vix", 20) + "</h2><div class=c><table><tr><th>Ticker</th><th>Price</th><th>RSI(2)</th><th>Status</th></tr>")
     for r in sorted(bot.call_sigs, key=lambda r: (r["k"] not in ("go", "held"), r["t"])):
         m = r.get("m")
