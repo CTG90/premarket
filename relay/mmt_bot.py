@@ -52,7 +52,7 @@ NAMES = {"SPY": "S&P 500 ETF", "QQQ": "Nasdaq ETF", "NVDA": "Nvidia", "AAPL": "A
 DEFAULTS = {
     "mode": "spreads",         # spreads = SPY/QQQ credit spreads (backtest winner) · buy = buy calls/puts · watch = no orders
     "account_size": 2500,      # the paper bot trades as if this were the whole account
-    "risk_per_trade_pct": 6,   # max loss per spread as % of account
+    "risk_per_trade_pct": 7,   # max loss per spread as % of the spread sleeve ($2 wide at ~0.30Δ ≈ $155 max loss)
     "max_total_risk_pct": 30,  # max loss across all open spreads as % of account
     "scale_every": 2500,       # +1 contract per spread for every $2,500 of account equity
     "spread_max_contracts": 10,
@@ -1026,7 +1026,7 @@ class Bot:
                  "qty": c["qty"], "play": "Bull put" if right == "P" else "Bear call", "score": None,
                  "feat": {"trend": tr, "rsi": round(ind["rsi"]) if ind["rsi"] else None, "vr": ind["vr"], "delta": c["delta"]},
                  "created": time.time(), "entry": {"px": limit, "und": m["price"], "at": time.time(), "iv": c["iv"]},
-                 "max_loss": (cfg["spread_width"] - limit) * 100 * c["qty"], "status": "opening"}
+                 "max_loss": (c.get("width", cfg["spread_width"]) - limit) * 100 * c["qty"], "status": "opening"}
             coid = self.send_spread(self.spread_order(t, True, limit), "open " + t["occ"])
             if coid:
                 t["open_order"] = {"coid": coid, "at": time.time(), "limit": limit}
@@ -1047,23 +1047,32 @@ class Bot:
         cands = [base + i for i in range(-6, 7)]
         occs = [occ(tk, iso, right, k) for k in cands]
         snaps = self.wb.option_snapshots(occs)
-        best = None
+        ranked = []
         for k, o in zip(cands, occs):
             q = snaps.get(o)
             dlt = f((q or {}).get("delta"))
             if dlt is None:
                 continue
-            gap = abs(abs(dlt) - cfg["spread_delta"])
-            if best is None or gap < best[0]:
-                best = (gap, k, o, q)
-        if not best:
+            ranked.append((abs(abs(dlt) - cfg["spread_delta"]), k, o, q))
+        if not ranked:
             return None, "no option quotes for %s" % iso
-        _, short_k, short_occ, sq = best
-        long_k = short_k - w if right == "P" else short_k + w
-        long_occ = occ(tk, iso, right, long_k)
-        lq = snaps.get(long_occ) or self.wb.option_snapshots([long_occ]).get(long_occ)
-        if not lq:
-            return None, "no quote for long leg %g" % long_k
+        ranked.sort(key=lambda x: x[0])
+        # closest-delta short strike whose long leg is actually listed (far-OTM strikes can skip $1-$2 steps)
+        pick = None
+        for gap, short_k, short_occ, sq in ranked[:6]:
+            if gap > 0.08:
+                break
+            for ww in (w, w + 1, w + 3):
+                long_k = short_k - ww if right == "P" else short_k + ww
+                long_occ = occ(tk, iso, right, long_k)
+                lq = snaps.get(long_occ) or self.wb.option_snapshots([long_occ]).get(long_occ)
+                if lq:
+                    pick = (short_k, short_occ, sq, long_k, long_occ, lq, ww); break
+            if pick:
+                break
+        if not pick:
+            return None, "no listed long leg near %g" % ranked[0][1]
+        short_k, short_occ, sq, long_k, long_occ, lq, w = pick
         sb, sa, sm = opt_px(sq); lb, la, lm = opt_px(lq)
         mid = sm - lm; nat = sb - la
         if mid < w * cfg["spread_min_credit_pct"] / 100:
@@ -1074,7 +1083,7 @@ class Bot:
             return None, "max loss $%.0f > %d%% of $%.0f" % (loss, cfg["risk_per_trade_pct"], eq)
         if self.open_risk("spread") + loss > eq * cfg["max_total_risk_pct"] / 100:
             return None, "would put >%d%% of account at risk" % cfg["max_total_risk_pct"]
-        return {"short_k": short_k, "long_k": long_k, "exp": iso, "short_occ": short_occ, "long_occ": long_occ,
+        return {"short_k": short_k, "long_k": long_k, "width": w, "exp": iso, "short_occ": short_occ, "long_occ": long_occ,
                 "mid": mid, "natural_credit": nat, "delta": f(sq.get("delta")), "iv": f(sq.get("imp_vol")), "qty": qty}, None
 
     # ── pullback calls (as call debit spreads) ────────────────────────
