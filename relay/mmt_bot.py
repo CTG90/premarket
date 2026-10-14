@@ -24,6 +24,7 @@ import datetime as dt
 import json
 import logging
 import math
+import re
 import os
 import sys
 import time
@@ -222,12 +223,29 @@ class WB:
         return out
 
     def option_snapshots(self, occs):
+        """Quotes for option symbols. Webull rejects a whole batch if ANY symbol isn't listed, so drop the bad ones and retry."""
         out = {}
         for i in range(0, len(occs), 20):
-            res = self.dc.option_market_data.get_option_snapshot(",".join(occs[i:i + 20]), self.Cat.US_OPTION.name)
-            for q in (self.body(res) or []):
-                if isinstance(q, dict) and q.get("symbol"):
-                    out[q["symbol"]] = q
+            batch = list(occs[i:i + 20])
+            for _ in range(3):
+                if not batch:
+                    break
+                try:
+                    res = self.dc.option_market_data.get_option_snapshot(",".join(batch), self.Cat.US_OPTION.name)
+                except Exception as e:
+                    msg = str(e)
+                    if "INVALID_SYMBOL" not in msg:
+                        raise
+                    bad = set(re.findall(r"[A-Z]{1,6}\d{6}[CP]\d{8}", msg.split("Invalid Symbol")[-1]))
+                    left = [x for x in batch if x not in bad]
+                    if not bad or len(left) == len(batch):
+                        break
+                    batch = left
+                    continue
+                for q in (self.body(res) or []):
+                    if isinstance(q, dict) and q.get("symbol"):
+                        out[q["symbol"]] = q
+                break
         return out
 
     def _call(self, fn, *a):
@@ -426,6 +444,18 @@ def friday_at_least(days):
     while d.weekday() != 4:
         d += dt.timedelta(days=1)
     return d.isoformat()
+
+
+def monthly_at_least(days):
+    """Third Friday of the first month whose third Friday is >= today + days."""
+    d0 = now_et().date() + dt.timedelta(days=days); y, mth = d0.year, d0.month
+    for _ in range(3):
+        first = dt.date(y, mth, 1); fri = first + dt.timedelta(days=(4 - first.weekday()) % 7 + 14)
+        if fri >= d0:
+            return fri.isoformat()
+        mth += 1
+        if mth > 12: y, mth = y + 1, 1
+    return friday_at_least(days)
 
 
 def occ(sym, iso, d, k):
@@ -628,6 +658,27 @@ class Bot:
         if label != self.pb_label and spy:
             say("🧭 Market read: " + label, self.st); self.pb_label = label
         return self.pb
+
+    def exp_for(self, tk, days, S):
+        """Pick a listed expiry near `days` out: target Friday, then ±1 week, then the monthly. Cached per day."""
+        key = "%s|%d|%s" % (tk, days, now_et().date().isoformat())
+        cache = self.__dict__.setdefault("_exp_cache", {})
+        if key in cache:
+            return cache[key]
+        cands = []
+        for iso in (friday_at_least(days), friday_at_least(max(1, days - 7)), friday_at_least(days + 7), monthly_at_least(days), monthly_at_least(max(1, days - 14))):
+            if iso not in cands:
+                cands.append(iso)
+        st = strike_step(S); k0 = round_strike(S); pick = cands[0]
+        for iso in cands:
+            probes = [occ(tk, iso, "C", k) for k in (k0, k0 + st, k0 - st, round(S / 5) * 5, round(S / 10) * 10)]
+            try:
+                if self.wb.option_snapshots(list(dict.fromkeys(probes))):
+                    pick = iso; break
+            except Exception:
+                pass
+        cache[key] = pick
+        return pick
 
     # helpers
     def open_trades(self, spreads=True):
@@ -966,7 +1017,7 @@ class Bot:
 
     def pick_spread(self, tk, S, right):
         cfg = self.cfg; w = cfg["spread_width"]
-        iso = friday_at_least(cfg["spread_dte"])
+        iso = self.exp_for(tk, cfg["spread_dte"], S)
         # rough strike for target delta, then scan ±6 strikes for the real delta from Webull
         ind = self.ind.get(tk) or {}
         sig = max(0.12, (ind.get("hv") or 15) / 100 * 1.15); T = max(dte(iso), 1) / 365
@@ -1087,7 +1138,7 @@ class Bot:
         self.pb_sigs = rows
 
     def pick_debit(self, tk, S):
-        cfg = self.cfg; iso = friday_at_least(cfg["pullback_dte"]); step = strike_step(S)
+        cfg = self.cfg; iso = self.exp_for(tk, cfg["pullback_dte"], S); step = strike_step(S)
         long_k = round_strike(S)
         cap = self.equity("debit") * cfg["pullback_risk_pct"] / 100
         widths = [step * k for k in (1, 2, 3, 4) if step * k <= S * 0.05] or [step]
@@ -1188,7 +1239,7 @@ class Bot:
 
     def pick_lotto(self, tk, S):
         """Scan OTM calls; take the one closest to lotto_delta that passes liquidity and price checks."""
-        cfg = self.cfg; iso = friday_at_least(cfg["lotto_dte"]); step = strike_step(S)
+        cfg = self.cfg; iso = self.exp_for(tk, cfg["lotto_dte"], S); step = strike_step(S)
         k0 = round_strike(S); ks = [k0 + step * i for i in range(1, 13)]
         snaps = self.wb.option_snapshots([occ(tk, iso, "C", k) for k in ks])
         best = None; why = "no listed calls"
@@ -1265,7 +1316,7 @@ class Bot:
                 row["label"] += " · max open"; continue
             if self.realized_today() <= -cfg["daily_loss_limit"] or len(self.today_entries()) >= cfg["max_orders_per_day"]:
                 row["label"] += " · daily limit"; continue
-            iso = friday_at_least(cfg["call_dte"]); k = round_strike(m["price"]); o = occ(tk, iso, "C", k)
+            iso = self.exp_for(tk, cfg["call_dte"], m["price"]); k = round_strike(m["price"]); o = occ(tk, iso, "C", k)
             q = self.wb.option_snapshots([o]).get(o)
             if not q:
                 row["label"] += " · skip: no quote"; continue
@@ -1363,7 +1414,7 @@ class Bot:
                 lv["src"][round(pm[tk][0], 2)] = "premarket high"; lv["src"][round(pm[tk][1], 2)] = "premarket low"
             # open-interest walls: biggest call OI above / put OI below, nearest weekly >= 5 days out
             try:
-                iso = friday_at_least(5); S = m["price"]; st = strike_step(S); k0 = round_strike(S)
+                S = m["price"]; iso = self.exp_for(tk, 5, S); st = strike_step(S); k0 = round_strike(S)
                 ks = [k0 + st * i for i in range(-8, 9)]
                 occs = [occ(tk, iso, r, k) for k in ks for r in ("C", "P")]
                 sn = self.wb.option_snapshots(occs)
@@ -1443,7 +1494,7 @@ class Bot:
         self.sr_sigs = rows
 
     def pick_sr(self, tk, S, d):
-        cfg = self.cfg; iso = friday_at_least(cfg["sr_dte"]); st = strike_step(S); k0 = round_strike(S)
+        cfg = self.cfg; iso = self.exp_for(tk, cfg["sr_dte"], S); st = strike_step(S); k0 = round_strike(S)
         ks = [k0 + st * i for i in range(0, 7)] if d == "C" else [k0 - st * i for i in range(0, 7)]
         sn = self.wb.option_snapshots([occ(tk, iso, d, k) for k in ks]); best = None; why = "no quotes"
         for k in ks:
@@ -1540,28 +1591,36 @@ class Bot:
             fresh = any(time.time() - q["ts"] < 20 * 60 for q in self.quotes.values()) if market else False
             if market and not fresh:
                 say("Quotes look stale (holiday/halt?) — no trading this cycle", self.st)
+            self.err = None
             self.check_pending()
             singles = [t["occ"] for t in self.st["trades"] if t["status"] in ("open", "closing") and t.get("kind") not in ("spread", "debit", "etf_trend", "etf_dip")]  # lotto + call + legacy singles
             opts = self.wb.option_snapshots(singles) if singles else {}
-            self.manage_exits(opts, market and fresh)
-            self.manage_spreads(market and fresh)
-            self.manage_debits(market and fresh)
-            self.manage_lotto(opts, market and fresh)
-            self.manage_calls(opts, market and fresh)
-            self.manage_sr(opts, market and fresh)
-            self.entries(window and fresh)
-            self.spread_entries(window and fresh)
-            self.pullback_entries(window and fresh)
-            self.lotto_entries(window and fresh)
-            self.call_entries(window and fresh)
-            self.sr_entries(window and fresh)
-            self.etf_sims(market, fresh)
+            for step in (
+                lambda: self.manage_exits(opts, market and fresh),
+                lambda: self.manage_spreads(market and fresh),
+                lambda: self.manage_debits(market and fresh),
+                lambda: self.manage_lotto(opts, market and fresh),
+                lambda: self.manage_calls(opts, market and fresh),
+                lambda: self.manage_sr(opts, market and fresh),
+                lambda: self.entries(window and fresh),
+                lambda: self.spread_entries(window and fresh),
+                lambda: self.pullback_entries(window and fresh),
+                lambda: self.lotto_entries(window and fresh),
+                lambda: self.call_entries(window and fresh),
+                lambda: self.sr_entries(window and fresh),
+                lambda: self.etf_sims(market, fresh),
+            ):
+                try:
+                    step()
+                except Exception as e:
+                    self.err = "%s: %s" % (type(e).__name__, str(e).splitlines()[0][:200] if str(e) else "")
+                    say("ERROR " + self.err, self.st)
+                    traceback.print_exc()
             if market and fresh and mins >= 930:
                 try:
                     self.log_iv()
                 except Exception as e:
                     say("IV log error: %s" % e, self.st)
-            self.err = None
         except Exception as e:
             self.err = "%s: %s" % (type(e).__name__, str(e).splitlines()[0][:200] if str(e) else "")
             say("ERROR " + self.err, self.st)
