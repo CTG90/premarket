@@ -200,9 +200,7 @@ pre.code{background:#060810;border:1px solid #1a2540;border-radius:8px;padding:1
     <button class="tab" data-tab="plan" onclick="sw('plan')">📋 Plan</button>
     <button class="tab" data-tab="holdings" onclick="sw('holdings')">💼 Holdings</button>
     <button class="tab" data-tab="calc" onclick="sw('calc')">🧮 P&amp;L</button>
-    <button class="tab" data-tab="earn" onclick="sw('earn')">📅 Earn</button>
     <button class="tab" data-tab="news" onclick="sw('news')">📰 News</button>
-    <button class="tab" data-tab="flow" onclick="sw('flow')">💰 Flow</button>
     <button class="tab" data-tab="wl" onclick="sw('wl')">👁 List</button>
   </div>
 </div>
@@ -275,7 +273,6 @@ pre.code{background:#060810;border:1px solid #1a2540;border-radius:8px;padding:1
   </div>
 </div>
 
-<div id="t-earn" class="tabpane" style="display:none"><div class="content" id="earnc"></div></div>
 
 <div id="t-news" class="tabpane" style="display:none">
   <div class="fbar">
@@ -287,7 +284,6 @@ pre.code{background:#060810;border:1px solid #1a2540;border-radius:8px;padding:1
   <div class="content" id="nc"><div class="ld"><div class="sp"></div><div style="font-size:13px;color:#5b6688">Loading news...</div></div></div>
 </div>
 
-<div id="t-flow" class="tabpane" style="display:none"><div class="content" id="flc"></div></div>
 
 <div id="t-wl" class="tabpane" style="display:none"><div class="content" id="wc"></div></div>
 
@@ -1280,28 +1276,6 @@ function solveUnderlying(target,K,T,sig,isCall,S0){
 }
 
 // ═════════════════════════════════════════════════════════════════
-// EARNINGS (live from quotes)
-// ═════════════════════════════════════════════════════════════════
-function renderEarn(){
-  var now=Date.now();
-  var list=movers.filter(function(m){return m.earnTs&&m.earnTs*1000>now-86400000}).map(function(m){return{m:m,d:(m.earnTs*1000-now)/86400000}}).sort(function(a,b){return a.d-b.d});
-  var h='<div class="note">Next earnings dates for your tickers, pulled live · manage IV crush</div>';
-  if(!movers.length) h+='<div class="es"><div class="ei">📅</div><div class="et">Loading quotes…</div></div>';
-  else if(!list.length) h+='<div class="es"><div class="ei">📅</div><div class="et">No earnings dates in the feed</div><div class="em">Yahoo only returns these on the v7 quote route.<br>Check the Earnings column in TOS for now.</div></div>';
-  list.forEach(function(x){
-    var dt=new Date(x.m.earnTs*1000),days=Math.ceil(x.d);
-    var cls=days<=2?'urgent':days<=7?'soon':'';
-    var held=HOLD.some(function(hh){return hh.t===x.m.ticker}),paper=openTrades().some(function(t){return t.ticker===x.m.ticker});
-    h+='<div class="earn-card '+cls+'"><div class="earn-date"><div class="earn-day">'+dt.getDate()+'</div><div class="earn-mon">'+dt.toLocaleDateString('en-US',{month:'short'}).toUpperCase()+'</div></div>';
-    h+='<div style="flex:1"><div style="font-size:14px;font-weight:700;color:#fff">'+x.m.ticker+' <span style="font-size:11px;color:#5b6688;font-weight:400">'+esc(x.m.name)+'</span></div>';
-    h+='<div style="font-size:11px;color:#9ca3af">'+(days<=0?'Today / just reported':'In '+days+' day'+(days>1?'s':''))+' · $'+x.m.price.toFixed(2)+'</div>';
-    h+='<div class="chips" style="margin:4px 0 0">'+(held?'<span class="chip b">You hold shares</span>':'')+(paper?'<span class="chip g">Open paper trade</span>':'')+'</div></div></div>';
-    if(days<=7&&days>=0) h+='<div class="warn">⚠️ IV crush: short-dated premiums often drop 30-60% right after the report. Close before the print or size for the binary move.</div>';
-  });
-  document.getElementById('earnc').innerHTML=h;
-}
-
-// ═════════════════════════════════════════════════════════════════
 // NEWS
 // ═════════════════════════════════════════════════════════════════
 async function fetchNews(){
@@ -1363,25 +1337,6 @@ function renderNews(){
   document.getElementById('nc').innerHTML=h;
 }
 function filterNews(f,btn){newsFilt=f;document.querySelectorAll('#t-news .fbar .fp').forEach(function(b){b.classList.remove('on')});btn.classList.add('on');renderNews()}
-
-// ═════════════════════════════════════════════════════════════════
-// FLOW (volume + price estimate — NOT real options flow)
-// ═════════════════════════════════════════════════════════════════
-function renderFlow(){
-  if(!movers.length){document.getElementById('flc').innerHTML='<div class="es"><div class="ei">💰</div><div class="et">Loading…</div></div>';return}
-  var flows=movers.filter(function(m){var rv=m.vol&&m.avgVol?m.vol/m.avgVol:0;return rv>=1.5||Math.abs(m.pct)>=2}).map(function(m){
-    var rv=m.vol&&m.avgVol?m.vol/m.avgVol:null;return{m:m,rv:rv,hot:(rv&&rv>=2)||Math.abs(m.pct)>=4};
-  }).sort(function(a,b){return(b.hot-a.hot)||((b.rv||0)-(a.rv||0))});
-  var h='<div class="warn">Estimated from stock volume and price, not real options prints. For actual unusual options activity use TOS → Trade → Option Statistics or Webull\'s options flow.</div>';
-  if(!flows.length) h+='<div class="es"><div class="ei">💰</div><div class="et">Quiet tape</div><div class="em">Nothing trading 1.5x volume or moving 2%+.</div></div>';
-  flows.forEach(function(f){
-    var up=f.m.pct>=0;
-    h+='<div class="flow-card '+(up?'flow-call':'flow-put')+'"><div style="display:flex;justify-content:space-between;align-items:center">';
-    h+='<div><div style="font-size:14px;font-weight:700;color:#fff">'+f.m.ticker+(f.hot?' <span class="chip r" style="font-size:9px">HOT</span>':'')+'</div><div style="font-size:11px;color:#5b6688">'+esc(f.m.name)+'</div></div>';
-    h+='<div style="text-align:right"><div class="'+(up?'up':'dn')+'" style="font-weight:700">'+(up?'+':'')+f.m.pct.toFixed(2)+'%</div><div style="font-size:11px;color:#9ca3af">'+(f.rv?f.rv.toFixed(1)+'x volume':'volume n/a')+'</div></div></div></div>';
-  });
-  document.getElementById('flc').innerHTML=h;
-}
 
 // ═════════════════════════════════════════════════════════════════
 // PLAN (live-ranked game plan)
@@ -1581,7 +1536,7 @@ function renderToday(){
 // ═════════════════════════════════════════════════════════════════
 // TABS / HELPERS / TIMERS
 // ═════════════════════════════════════════════════════════════════
-var TABS=['today','bot','movers','strikes','swings','plan','holdings','calc','earn','news','flow','wl'];
+var TABS=['today','bot','movers','strikes','swings','plan','holdings','calc','news','wl'];
 function sw(tab){
   CUR_TAB=tab;
   TABS.forEach(function(t){document.getElementById('t-'+t).style.display=(t===tab?'block':'none')});
@@ -1597,9 +1552,7 @@ function renderTab(tab){
   else if(tab==='swings') renderSwings();
   else if(tab==='plan') renderPlan();
   else if(tab==='holdings') renderHoldings();
-  else if(tab==='earn') renderEarn();
   else if(tab==='news'){renderNews();if(!allNews.length&&movers.length)loadNews()}
-  else if(tab==='flow') renderFlow();
   else if(tab==='wl') renderWL();
 }
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
