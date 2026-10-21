@@ -184,7 +184,7 @@ dialog h2{margin-bottom:4px}
   </header>
   <div class="session" id="session"></div>
   <div class="banner" id="keyBanner" hidden>
-    <span>Prices are polling every 6 seconds. Add a free Finnhub key to stream every trade as it prints.</span>
+    <span id="bannerTxt">Add a free Finnhub key to stream every trade as it prints.</span>
     <button class="hbtn" type="button" id="bannerSet">Add key</button>
   </div>
 
@@ -235,6 +235,11 @@ dialog h2{margin-bottom:4px}
       <label for="fWatch">Watchlist</label>
       <p>Tickers separated by commas.</p>
       <input id="fWatch" autocomplete="off" spellcheck="false"/>
+    </div>
+    <div class="field">
+      <label for="fProxy">Yahoo proxy (optional)</label>
+      <p>Chart history, pre-market bars and the no-key fallback come from Yahoo, which needs a proxy. Paste your own proxy URL ending in <code>?url=</code>. Setup steps are in worker/yahoo-proxy.js in the repo.</p>
+      <input id="fProxy" autocomplete="off" spellcheck="false" placeholder="https://yahoo-proxy.yourname.workers.dev/?url="/>
     </div>
     <div class="field">
       <label>Theme</label>
@@ -293,27 +298,38 @@ function vol(v){if(!v)return '--';if(v>=1e9)return (v/1e9).toFixed(2)+'B';if(v>=
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 
 // ── NETWORK: Yahoo through CORS proxies (remembers the fast one) ─
-var PROXIES=[
-  function(u){return 'https://corsproxy.io/?url='+encodeURIComponent(u)},
+// Public proxies die often (corsproxy.io went paid in 2026). A private
+// proxy (see worker/yahoo-proxy.js) can be set in Settings and is tried first.
+var PUBLIC_PROXIES=[
   function(u){return 'https://api.allorigins.win/raw?url='+encodeURIComponent(u)},
-  function(u){return 'https://api.codetabs.com/v1/proxy/?quest='+encodeURIComponent(u)}
+  function(u){return 'https://api.codetabs.com/v1/proxy/?quest='+encodeURIComponent(u)},
+  function(u){return 'https://corsproxy.io/?url='+encodeURIComponent(u)}
 ];
-var bestProxy=lsGet('pl_proxy',0);
+var PROXIES=[];
+function buildProxies(){
+  PROXIES=PUBLIC_PROXIES.slice();
+  var t=(CFG.proxy||'').trim();
+  if(t)PROXIES.unshift(function(u){return t.indexOf('{url}')>=0?t.replace('{url}',encodeURIComponent(u)):t+encodeURIComponent(u)});
+  bestProxy=0;yFails=0;yDownUntil=0;
+}
+var bestProxy=0,yFails=0,yDownUntil=0;
+function yahooDown(){return Date.now()<yDownUntil}
 function getVia(i,url,ms){
   var c=new AbortController(),tm=setTimeout(function(){c.abort()},ms);
   return fetch(PROXIES[i](url),{signal:c.signal,cache:'no-store'}).then(function(r){clearTimeout(tm);if(!r.ok)throw 0;return r.text()}).then(function(t){if(!t||/^\s*<(!doctype html|html)/i.test(t))throw 0;return t});
 }
 function proxyText(url,ms){
   ms=ms||6000;
-  return getVia(bestProxy,url,ms).catch(function(){
+  if(yahooDown())return Promise.resolve(null);
+  return getVia(bestProxy,url,ms).then(function(t){yFails=0;return t}).catch(function(){
     // preferred route failed: race the rest, remember the winner
     return new Promise(function(res){
       var left=0,done=false;
       PROXIES.forEach(function(_,i){
         if(i===bestProxy)return; left++;
-        getVia(i,url,ms+2000).then(function(t){if(!done){done=true;bestProxy=i;lsSet('pl_proxy',i);res(t)}}).catch(function(){if(--left===0&&!done)res(null)});
+        getVia(i,url,ms+2000).then(function(t){if(!done){done=true;bestProxy=i;yFails=0;res(t)}}).catch(function(){if(--left===0&&!done){if(++yFails>=3){yDownUntil=Date.now()+300000;setStatus()}res(null)}});
       });
-      if(!left)res(null);
+      if(!left){if(++yFails>=3)yDownUntil=Date.now()+300000;res(null)}
     });
   });
 }
@@ -445,11 +461,15 @@ function setStatus(){
   else if(CFG.key&&wsState==='open'){c='stream';t='Streaming'}
   else if(CFG.key&&wsState==='connecting'){c='poll';t='Connecting stream'}
   else if(CFG.key){c='poll';t='Reconnecting stream'}
-  else if(netGood&&netGood>=netBad){c='poll';t='Polling every '+(POLL_FAST/1000)+'s'}
-  else if(netBad){c='bad';t='Quote source not answering'}
+  else if(netGood&&netGood>=netBad&&!yahooDown()){c='poll';t='Polling every '+(POLL_FAST/1000)+'s'}
+  else if(netBad){c='bad';t='No quote source'}
   else t='Connecting';
   el.className='status '+c;tx.textContent=t;
-  document.getElementById('keyBanner').hidden=!!CFG.key&&!keyBad;
+  var bn=document.getElementById('keyBanner'),need=!CFG.key||keyBad;
+  bn.hidden=!need;
+  if(need)document.getElementById('bannerTxt').textContent=keyBad?'Finnhub turned that key down. Check it in Settings.':
+    (netBad&&!(netGood>netBad))?'The free Yahoo proxies are down, so prices can’t load without a key. Add a free Finnhub key to stream live prices.':
+    'Prices are polling every 6 seconds. Add a free Finnhub key to stream every trade as it prints.';
 }
 
 // ── RENDER ──────────────────────────────────────────────────────
@@ -663,7 +683,7 @@ function loadChart(){
   proxyJSON(url,9000).then(function(d){
     if(id!==chartReq)return;
     var x=d&&d.chart&&d.chart.result&&d.chart.result[0];
-    if(!x){document.getElementById('cinfo').textContent='Could not load '+r+' history. Try again in a moment.';return}
+    if(!x){document.getElementById('cinfo').textContent=r.toUpperCase()+' history comes from Yahoo, which isn’t reachable right now. Set a private proxy in Settings to turn it on.';return}
     var ts=x.timestamp||[],k=x.indicators.quote[0],b=[];
     for(var i=0;i<ts.length;i++)if(k.close[i]!=null)b.push({time:ts[i],open:k.open[i],high:k.high[i],low:k.low[i],close:k.close[i],volume:k.volume[i]||0});
     setBars(b);chart.timeScale().fitContent();priceLines(s);showLast();
@@ -773,6 +793,7 @@ var dlg=document.getElementById('dlg');
 function openSettings(){
   document.getElementById('fKey').value=CFG.key||'';
   document.getElementById('fWatch').value=CFG.watch.join(', ');
+  document.getElementById('fProxy').value=CFG.proxy||'';
   var g=document.getElementById('hgrid');
   g.innerHTML='<span></span><span class="hl">Shares</span><span class="hl">Avg cost</span>'+CFG.big.map(function(s){var h=CFG.hold[s]||{};
     return '<span>'+s+'</span><input inputmode="decimal" data-s="'+s+'" data-f="sh" value="'+(h.sh||'')+'" aria-label="'+s+' shares"/><input inputmode="decimal" data-s="'+s+'" data-f="cost" value="'+(h.cost||'')+'" placeholder="$" aria-label="'+s+' average cost"/>'}).join('');
@@ -787,6 +808,8 @@ document.getElementById('setForm').addEventListener('submit',function(e){
   CFG.key=document.getElementById('fKey').value.trim();
   CFG.watch=document.getElementById('fWatch').value.toUpperCase().split(/[\s,]+/).filter(function(x){return /^[A-Z.\-^=]{1,10}$/.test(x)});
   document.querySelectorAll('#hgrid input').forEach(function(i){var s=i.dataset.s;CFG.hold[s]=CFG.hold[s]||{};var v=parseFloat(i.value.replace(/[$,]/g,''));CFG.hold[s][i.dataset.f]=v>0?v:null});
+  var np=document.getElementById('fProxy').value.trim();
+  if(np!==(CFG.proxy||'')){CFG.proxy=np;buildProxies()}
   saveCfg();
   if(CFG.key!==oldKey){keyBad=false;try{ws&&ws.close()}catch(x){}if(CFG.key)wsConnect();else wsState='off'}
   buildWatch();syncSubs();startLoops();refreshAll();CFG.big.forEach(function(s){renderCard(s)});renderSum();setStatus();loadChart();
@@ -819,7 +842,7 @@ document.getElementById('wakeBtn').onclick=function(){
 document.addEventListener('visibilitychange',function(){if(!document.hidden&&document.getElementById('wakeBtn').classList.contains('on')&&!wake){navigator.wakeLock.request('screen').then(function(w){wake=w}).catch(function(){})}});
 
 // ── BOOT ────────────────────────────────────────────────────────
-applyTheme();
+applyTheme();buildProxies();
 buildCards();buildWatch();renderSession();setStatus();
 initChart();loadChart();
 if(CFG.key){wsConnect();CFG.big.forEach(fhEarnings)}

@@ -8,6 +8,7 @@
 - Positions: shares and avg cost per holding (defaults 600 NVDA, 100 AMZN, 100 AAPL; reads avg cost from the Research Holdings tab), day P&L and total gain, big-three total.
 - Candlestick chart (1D live, 5D, 1M, 6M, 1Y) with previous-close and your-cost lines; headlines per ticker; next earnings date (Finnhub).
 - Keep-screen-on toggle, light/dark/auto theme, phone layout.
+- Public CORS proxies are dead as of Oct 20 (corsproxy.io now needs a paid key; allorigins and codetabs time out), which is why Yahoo data was lagging or missing. Finnhub is called directly (CORS-enabled), so a key is now the main data path. Optional private Yahoo proxy in Settings for chart history; Cloudflare Worker in worker/yahoo-proxy.js. Yahoo calls back off for 5 min after 3 straight failures.
 - Old index.html moved to research.html (unchanged apart from a Live link). trade.html links to both.
 
 ## Speed fix — Oct 12 2026
