@@ -368,21 +368,31 @@ function lsSet(k,v){try{localStorage.setItem(k,JSON.stringify(v));return true}ca
 // ── NETWORK ───────────────────────────────────────────────────────
 // Yahoo sends no CORS headers, so a page on github.io can't call it
 // directly. Race both public CORS proxies; first good answer wins.
-var PROXIES=[function(u){return'https://corsproxy.io/?'+encodeURIComponent(u)},function(u){return'https://api.allorigins.win/raw?url='+encodeURIComponent(u)}];
-var NET={ok:0,fail:0,last:0};
+// Oct 20 2026: the public proxies are dead (corsproxy.io went paid, allorigins
+// hangs), which made this page sit on timeouts. Now: a private proxy and the
+// Finnhub key from Premarket Live's Settings are used when set, and Yahoo is
+// skipped for 5 minutes after 3 straight failures so the page renders fast.
+var PLCFG=lsGet('pl_cfg',{})||{};
+var FHKEY=PLCFG.key||'';
+var PROXIES=[function(u){return'https://api.allorigins.win/raw?url='+encodeURIComponent(u)},function(u){return'https://api.codetabs.com/v1/proxy/?quest='+encodeURIComponent(u)}];
+if(PLCFG.proxy){(function(t){PROXIES=[function(u){return t.indexOf('{url}')>=0?t.replace('{url}',encodeURIComponent(u)):t+encodeURIComponent(u)}]})(PLCFG.proxy.trim())}
+var NET={ok:0,fail:0,last:0,streak:0};
+function yDown(){var u=lsGet('pp_ydown',0);return u&&Date.now()<u&&u-Date.now()<=300000}
+function fhGet(path){return fetch('https://finnhub.io/api/v1/'+path+(path.indexOf('?')<0?'?':'&')+'token='+encodeURIComponent(FHKEY),{cache:'no-store'}).then(function(r){return r.ok?r.json():null}).catch(function(){return null})}
 function tmo(ms){try{return AbortSignal.timeout(ms)}catch(e){var c=new AbortController();setTimeout(function(){c.abort()},ms);return c.signal}}
 function fetchText(url,timeout){
   var t0=Date.now();
+  if(yDown()) return Promise.resolve(null);
   return new Promise(function(resolve){
     var left=PROXIES.length,done=false,ctrls=[];
-    function fin(){if(--left===0&&!done){done=true;NET.fail++;resolve(null)}}
+    function fin(){if(--left===0&&!done){done=true;NET.fail++;if(++NET.streak>=3)lsSet('pp_ydown',Date.now()+300000);resolve(null)}}
     PROXIES.forEach(function(p){
       var c=new AbortController();ctrls.push(c);
-      var timer=setTimeout(function(){try{c.abort()}catch(e){}},timeout||7000);
+      var timer=setTimeout(function(){try{c.abort()}catch(e){}},Math.min(timeout||5000,6000));
       fetch(p(url),{signal:c.signal}).then(function(r){return r.ok?r.text():null}).then(function(txt){
         clearTimeout(timer);
         if(!done&&txt&&!/^\s*<(!doctype html|html)/i.test(txt)){
-          done=true;NET.ok++;NET.last=Date.now()-t0;
+          done=true;NET.ok++;NET.streak=0;NET.last=Date.now()-t0;
           ctrls.forEach(function(x){if(x!==c){try{x.abort()}catch(e){}}});
           resolve(txt);
         }else fin();
@@ -409,7 +419,17 @@ async function pool(items,n,fn){
 function r2(x){return Math.round(x*100)/100}
 var V7_OFF=lsGet('pp_v7off','')===etDateStr();
 function etDayOf(ts){return new Date(ts*1000).toLocaleDateString('en-CA',{timeZone:'America/New_York'})}
+async function fetchQF(ticker){
+  if(!FHKEY||/[\^=]|-USD$/.test(ysym(ticker))) return null;
+  var d=await fhGet('quote?symbol='+encodeURIComponent(ticker));
+  if(!d||!d.c) return null;
+  var wm=wlOf(ticker),ind=IND[ticker],pv=d.pc||d.c;
+  return{ticker:ticker,name:(wm?wm.n:null)||ticker,price:r2(d.c),pct:r2((d.c-pv)/pv*100),change:r2(d.c-pv),prev:r2(pv),
+    high:d.h||null,low:d.l||null,vol:null,avgVol:ind?ind.avgVol:null,hi52:null,lo52:null,earnTs:null};
+}
 async function fetchQ(ticker){
+  var qf=await fetchQF(ticker);
+  if(qf) return qf;
   if(!V7_OFF){
     var q7=await fetchQ7(ticker);
     if(q7) return q7;
@@ -1064,19 +1084,25 @@ async function go(){
   var res=[],done=0,first=movers.length===0;
   setStat('Loading quotes…','scl');
   var vixP=Promise.all([fetchQ8('^VIX'),fetchQ8('^VIX3M')]);
-  await pool(ALL_T,6,async function(t){
+  // With a Finnhub key, indexes (^GSPC etc.) still need Yahoo: fetch those
+  // in the background so a slow or dead proxy can't hold up the page.
+  var slowT=FHKEY?ALL_T.filter(function(t){return /[\^=]|-USD$/.test(ysym(t))}):[];
+  var fastT=ALL_T.filter(function(t){return slowT.indexOf(t)<0});
+  await pool(fastT,6,async function(t){
     var q=await fetchQ(t);done++;
-    if(first) setLoad('Fetching quotes… '+done+'/'+ALL_T.length);
+    if(first) setLoad('Fetching quotes… '+done+'/'+fastT.length);
     if(q&&q.price>0) res.push(q);
   });
-  var vv=await vixP;
-  if(vv[0]) VIX=vv[0].price;
-  if(vv[1]) VIX3M=vv[1].price;
-  if(VIX!=null){var sv=document.getElementById('sVix');sv.textContent=VIX.toFixed(1);sv.style.color=VIX>25?'#ef4444':VIX>18?'#f59e0b':'#10b981'}
+  if(slowT.length) pool(slowT,3,async function(t){var q=await fetchQ8(t);if(q&&q.price>0&&!quoteOf(t)){movers.push(q);render();renderTab(CUR_TAB)}});
+  vixP.then(function(vv){
+    if(vv[0]) VIX=vv[0].price;
+    if(vv[1]) VIX3M=vv[1].price;
+    if(VIX!=null){var sv=document.getElementById('sVix');sv.textContent=VIX.toFixed(1);sv.style.color=VIX>25?'#ef4444':VIX>18?'#f59e0b':'#10b981'}
+  });
   if(!res.length){
     btn.classList.remove('spinning');BUSY=false;
-    document.getElementById('mc').innerHTML='<div class="es"><div class="ei">⚠️</div><div class="et">No data loaded</div><div class="em">Both CORS proxies failed. Try again in a minute.</div></div>';
-    setStat('No quotes loaded — proxies may be rate-limiting','ser');
+    document.getElementById('mc').innerHTML='<div class="es"><div class="ei">⚠️</div><div class="et">No data loaded</div><div class="em">'+(FHKEY?'Finnhub did not answer. Check the key in Live → Settings.':'The free Yahoo proxies are down. Add a Finnhub key in Live → Settings (index.html) and reload.')+'</div></div>';
+    setStat(FHKEY?'No quotes loaded':'No quote source — add a Finnhub key on the Live page','ser');
     renderTab(CUR_TAB);
     return;
   }
@@ -1090,7 +1116,7 @@ async function go(){
   btn.classList.remove('spinning');
   var acted=botTick();
   var open=mktOpen();
-  setStat((open?'🟢 Live · ':'🟡 Last close · ')+res.length+' tickers · levels for '+Object.keys(IND).length+(VIX?' · VIX '+VIX.toFixed(1):'')+(acted?' · 🤖 '+acted+' bot action'+(acted>1?'s':''):''),open?'slv':'scl');
+  setStat((open?'🟢 Live · ':'🟡 Last close · ')+res.length+' tickers · levels for '+Object.keys(IND).length+(yDown()?' (Yahoo unreachable — set a proxy in Live → Settings)':'')+(VIX?' · VIX '+VIX.toFixed(1):'')+(acted?' · 🤖 '+acted+' bot action'+(acted>1?'s':''):''),open?'slv':'scl');
   document.getElementById('sT').textContent=res.length;
   var pmM=res.filter(function(m){return m.pmPrice&&Math.abs(m.pmPct||0)>=2});
   document.getElementById('sH').textContent=pmM.length?pmM.length+'🌅':res.filter(function(m){return scoreM(m).s>=65}).length;
@@ -1346,6 +1372,15 @@ function renderEcon(){
 // ═════════════════════════════════════════════════════════════════
 async function fetchNews(){
   var items=[],tickers=WL.filter(function(w){return w.sector!=='Index'}).map(function(w){return w.t});
+  if(FHKEY){
+    var fr=new Date(Date.now()-3*86400000).toISOString().slice(0,10),to=new Date().toISOString().slice(0,10);
+    await pool(tickers,3,async function(t){
+      var a=await fhGet('company-news?symbol='+t+'&from='+fr+'&to='+to);
+      (a||[]).slice(0,3).forEach(function(n){var pub=new Date(n.datetime*1000).toUTCString(),s=analyzeSentiment(n.headline||'');
+        items.push({ticker:t,title:n.headline,pub:pub,link:n.url,sentiment:s.signal,trade:s.trade,category:s.cat,age:timeAgo(pub)})});
+    });
+    if(items.length){items.sort(function(a,b){return new Date(b.pub)-new Date(a.pub)});return items}
+  }
   await pool(tickers,3,async function(t){
     var xml=await fetchText('https://feeds.finance.yahoo.com/rss/2.0/headline?s='+t+'&region=US&lang=en-US');
     if(!xml) return;
@@ -1658,7 +1693,7 @@ function renderToday(){
     if(!top.length) h+='<div class="card pad" style="font-size:12px;color:#5b6688">No call/put setups scoring right now.</div>';
     top.forEach(function(x){
       var m=x.m,sc=x.sc,dir=dirOfPlay(sc.play),iso=fridayAtLeast(PP.cfg.minDTE),k=roundStrike(m.price*(dir==='C'?1+PP.cfg.otm/100:1-PP.cfg.otm/100)),q=IND[m.ticker]?optQuote(m.ticker,m.price,k,iso,dir==='C'):null;
-      h+='<div class="card pad"><div style="display:flex;align-items:center;gap:10px"><div class="ring '+(sc.s>=70?'rh':sc.s>=50?'rm':'rl')+'">'+sc.s+'</div><div style="flex:1;min-width:0"><div class="tk">'+m.ticker+' <span class="pb '+sc.pc+'">'+sc.play+'</span></div><div class="nm">'+(q?fmtExp(iso)+' $'+k+dir+' · model ~$'+q.mid.toFixed(2):'Levels loading')+'</div></div>';
+      h+='<div class="card pad"><div style="display:flex;align-items:center;gap:10px"><div class="ring '+(sc.s>=70?'rh':sc.s>=50?'rm':'rl')+'">'+sc.s+'</div><div style="flex:1;min-width:0"><div class="tk">'+m.ticker+' <span class="pb '+sc.pc+'">'+sc.play+'</span></div><div class="nm">'+(q?fmtExp(iso)+' $'+k+dir+' · model ~$'+q.mid.toFixed(2):(yDown()?'Levels need the Yahoo proxy':'Levels loading'))+'</div></div>';
       h+='<div class="cr2"><div class="cc '+(m.pct>=0?'up':'dn')+'">'+(m.pct>=0?'+':'')+m.pct.toFixed(2)+'%</div><div class="cp">$'+m.price.toFixed(2)+'</div></div></div>';
       h+='<div style="font-size:12px;color:#9ca3af;margin-top:6px;line-height:1.5">'+sc.strat+'</div>';
       if(q) h+=ideaButtons(m.ticker,dir,k,iso,sc.play);
