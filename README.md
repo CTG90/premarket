@@ -10,7 +10,7 @@ Single-file pages, no build step, no backend. Open in a browser or host on GitHu
 Live URL: https://ctg90.github.io/premarket/
 
 ## Tabs
-Today, Bot, Movers, Strikes, Swings, Plan, Holdings, P&L, Earn, Macro, News, Flow, Crowd, Pol, List
+Today, Bot, Movers, Strikes, Swings, Plan, Holdings, P&L, Earn, News, Flow, List (Macro, Crowd and Pol removed Oct 20)
 
 ## How it works
 - Quotes: Yahoo Finance v7 (v8 fallback), direct then corsproxy.io then allorigins.win. The route that works is remembered.

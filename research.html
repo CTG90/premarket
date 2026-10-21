@@ -201,11 +201,8 @@ pre.code{background:#060810;border:1px solid #1a2540;border-radius:8px;padding:1
     <button class="tab" data-tab="holdings" onclick="sw('holdings')">💼 Holdings</button>
     <button class="tab" data-tab="calc" onclick="sw('calc')">🧮 P&amp;L</button>
     <button class="tab" data-tab="earn" onclick="sw('earn')">📅 Earn</button>
-    <button class="tab" data-tab="econ" onclick="sw('econ')">🌐 Macro</button>
     <button class="tab" data-tab="news" onclick="sw('news')">📰 News</button>
     <button class="tab" data-tab="flow" onclick="sw('flow')">💰 Flow</button>
-    <button class="tab" data-tab="comm" onclick="sw('comm')">👥 Crowd</button>
-    <button class="tab" data-tab="pols" onclick="sw('pols')">🏛 Pol</button>
     <button class="tab" data-tab="wl" onclick="sw('wl')">👁 List</button>
   </div>
 </div>
@@ -279,7 +276,6 @@ pre.code{background:#060810;border:1px solid #1a2540;border-radius:8px;padding:1
 </div>
 
 <div id="t-earn" class="tabpane" style="display:none"><div class="content" id="earnc"></div></div>
-<div id="t-econ" class="tabpane" style="display:none"><div class="content" id="econc"></div></div>
 
 <div id="t-news" class="tabpane" style="display:none">
   <div class="fbar">
@@ -292,27 +288,6 @@ pre.code{background:#060810;border:1px solid #1a2540;border-radius:8px;padding:1
 </div>
 
 <div id="t-flow" class="tabpane" style="display:none"><div class="content" id="flc"></div></div>
-
-<div id="t-comm" class="tabpane" style="display:none">
-  <div class="fbar">
-    <button class="fp on" onclick="filterComm('all',this)">All</button>
-    <button class="fp" onclick="filterComm('match',this)">⭐ On My List</button>
-    <button class="fp" onclick="filterComm('up',this)">🟢 Up</button>
-    <button class="fp" onclick="filterComm('down',this)">🔴 Down</button>
-  </div>
-  <div class="content" id="commc"></div>
-</div>
-
-<div id="t-pols" class="tabpane" style="display:none">
-  <div class="fbar">
-    <button class="fp on" onclick="sortPols('new',this)">🕐 Newest</button>
-    <button class="fp" onclick="sortPols('old',this)">🕐 Oldest</button>
-    <button class="fp" onclick="sortPols('wl',this)">⭐ Watchlist</button>
-    <button class="fp" onclick="sortPols('buy',this)">🟢 Buys</button>
-    <button class="fp" onclick="sortPols('sell',this)">🔴 Sells</button>
-  </div>
-  <div class="content" id="polc"></div>
-</div>
 
 <div id="t-wl" class="tabpane" style="display:none"><div class="content" id="wc"></div></div>
 
@@ -354,10 +329,9 @@ var HOLD=[{t:'NVDA',sh:600},{t:'AAPL',sh:100},{t:'AMZN',sh:100}];
 var DAILY_EXP=['SPY','QQQ','IWM','SPX']; // tickers with 0DTE every weekday
 
 var ALL_T=WL.map(function(w){return w.t}).concat(EXTRA).filter(function(v,i,a){return a.indexOf(v)===i});
-var movers=[],filt='all',exp=null,allNews=[],newsFilt='all',polTrades=[],polSort='new',commFilt='all',crowd=[],macro={};
+var movers=[],filt='all',exp=null,allNews=[],newsFilt='all';
 var IND={};          // ticker -> indicators from 1y daily history
 var VIX=null,VIX3M=null,BUSY=false,LAST_RUN=null,CUR_TAB='today';
-var seenPols=lsGet('sp',[]);
 
 function wlOf(t){return WL.find(function(w){return w.t===t})||null}
 function ysym(t){var w=wlOf(t);return w&&w.y?w.y:t}
@@ -1328,46 +1302,6 @@ function renderEarn(){
 }
 
 // ═════════════════════════════════════════════════════════════════
-// MACRO (live regime dashboard)
-// ═════════════════════════════════════════════════════════════════
-var MACRO_SYMS=[['^TNX','10Y yield','%'],['DX-Y.NYB','US Dollar',''],['CL=F','Crude oil','$'],['GC=F','Gold','$'],['BTC-USD','Bitcoin','$'],['^VIX3M','VIX 3-month','']];
-var MACRO_AT=0;
-async function loadMacro(){
-  if(Date.now()-MACRO_AT<5*60000) return;
-  MACRO_AT=Date.now();
-  await pool(MACRO_SYMS,3,async function(s){var q=await fetchQ(s[0]);if(q)macro[s[0]]=q});
-  if(macro['^VIX3M']) VIX3M=macro['^VIX3M'].price;
-  if(CUR_TAB==='econ') renderEcon();
-}
-function renderEcon(){
-  var reg=regimeOf(),h='';
-  h+='<div class="card pad" style="border-color:'+reg.c+'"><div style="font-size:11px;color:#5b6688;text-transform:uppercase">Market regime</div><div style="font-size:22px;font-weight:800;color:'+reg.c+'">'+reg.l+'</div>';
-  reg.why.forEach(function(w){h+='<div style="font-size:12px;color:#9ca3af">• '+esc(w)+'</div>'});
-  h+='<div style="font-size:11px;color:#5b6688;margin-top:6px">The bot pauses new calls in Risk-off (toggle in Bot → Rules).</div></div>';
-  h+='<div class="sect" style="color:#818cf8">Index trend</div>';
-  ['SPY','QQQ','IWM'].forEach(function(t){
-    var m=quoteOf(t),i=IND[t];if(!m) return;
-    var tr=trendOf(t,m.price);
-    h+='<div class="wli" style="display:flex;justify-content:space-between;align-items:center"><div><div style="font-weight:700;color:#fff">'+t+'</div><div style="font-size:11px;color:#5b6688">'+(i?'50d $'+(i.sma50||0).toFixed(2)+' · 200d $'+(i.sma200?i.sma200.toFixed(2):'--')+' · RSI '+(i.rsi||0).toFixed(0):'loading history')+'</div></div>';
-    h+='<div style="text-align:right"><div class="'+(m.pct>=0?'up':'dn')+'" style="font-weight:700">'+(m.pct>=0?'+':'')+m.pct.toFixed(2)+'%</div><div style="font-size:11px;color:'+(tr==='up'?'#10b981':tr==='down'?'#ef4444':'#f59e0b')+'">'+tr+'trend</div></div></div>';
-  });
-  h+='<div class="sect" style="color:#f59e0b">Cross-asset</div>';
-  var vx=VIX!=null?'<div class="wli" style="display:flex;justify-content:space-between"><div><div style="font-weight:700;color:#fff">VIX</div><div style="font-size:11px;color:#5b6688">'+(VIX3M?'VIX3M '+VIX3M.toFixed(2)+' · '+(VIX>VIX3M?'backwardation (stress)':'contango (normal)'):'')+'</div></div><div style="font-weight:700;color:'+(VIX>25?'#ef4444':VIX>18?'#f59e0b':'#10b981')+'">'+VIX.toFixed(2)+'</div></div>':'';
-  h+=vx;
-  var any=false;
-  MACRO_SYMS.forEach(function(s){
-    if(s[0]==='^VIX3M') return;
-    var q=macro[s[0]];if(!q) return;any=true;
-    var v=s[2]==='%'?q.price.toFixed(2)+'%':(s[2]==='$'?'$':'')+q.price.toLocaleString(undefined,{maximumFractionDigits:2});
-    h+='<div class="wli" style="display:flex;justify-content:space-between"><div style="font-weight:700;color:#fff">'+s[1]+'</div><div style="text-align:right"><div style="font-weight:700;color:#fff">'+v+'</div><div class="'+(q.pct>=0?'up':'dn')+'" style="font-size:11px">'+(q.pct>=0?'+':'')+q.pct.toFixed(2)+'%</div></div></div>';
-  });
-  if(!any) h+='<div class="note">Loading yields, dollar, oil, gold, bitcoin…</div>';
-  h+='<div class="warn">Economic calendar (CPI, jobs, FOMC) isn\'t available from a free feed. Check TOS → MarketWatch → Calendar before trading event days.</div>';
-  document.getElementById('econc').innerHTML=h;
-  loadMacro();
-}
-
-// ═════════════════════════════════════════════════════════════════
 // NEWS
 // ═════════════════════════════════════════════════════════════════
 async function fetchNews(){
@@ -1447,80 +1381,6 @@ function renderFlow(){
     h+='<div style="text-align:right"><div class="'+(up?'up':'dn')+'" style="font-weight:700">'+(up?'+':'')+f.m.pct.toFixed(2)+'%</div><div style="font-size:11px;color:#9ca3af">'+(f.rv?f.rv.toFixed(1)+'x volume':'volume n/a')+'</div></div></div></div>';
   });
   document.getElementById('flc').innerHTML=h;
-}
-
-// ═════════════════════════════════════════════════════════════════
-// CROWD (Yahoo trending, live)
-// ═════════════════════════════════════════════════════════════════
-var CROWD_AT=0;
-async function loadCrowd(){
-  if(Date.now()-CROWD_AT<10*60000&&crowd.length){renderComm();return}
-  document.getElementById('commc').innerHTML='<div class="ld"><div class="sp"></div><div style="font-size:13px;color:#5b6688">Loading trending tickers…</div></div>';
-  var d=await fetchJSON('https://query1.finance.yahoo.com/v1/finance/trending/US?count=25');
-  var syms=[];
-  try{syms=d.finance.result[0].quotes.map(function(q){return q.symbol}).filter(function(s){return/^[A-Z.]{1,6}$/.test(s)}).slice(0,15)}catch(e){}
-  var out=[];
-  await pool(syms,4,async function(s,i){var q=quoteOf(s)||await fetchQ(s);if(q){q.rank=i+1;out.push(q)}});
-  crowd=out.sort(function(a,b){return a.rank-b.rank});CROWD_AT=Date.now();
-  renderComm();
-}
-function renderComm(){
-  var list=crowd.slice();
-  if(commFilt==='match') list=list.filter(function(c){return!!wlOf(c.ticker)});
-  else if(commFilt==='up') list=list.filter(function(c){return c.pct>=0});
-  else if(commFilt==='down') list=list.filter(function(c){return c.pct<0});
-  var h='<div class="note">Most-searched tickers on Yahoo Finance right now · live</div>';
-  if(!crowd.length) h+='<div class="es"><div class="ei">👥</div><div class="et">Trending feed unavailable</div><div class="em">Proxy or Yahoo blocked it. Try again later.</div></div>';
-  list.forEach(function(c){
-    var on=!!wlOf(c.ticker),sc=scoreM(c);
-    h+='<div class="wli" style="display:flex;align-items:center;gap:10px"><div class="ring '+(sc.s>=70?'rh':sc.s>=50?'rm':sc.s>=35?'rl':'rs')+'" style="width:36px;height:36px;font-size:11px">'+sc.s+'</div>';
-    h+='<div style="flex:1;min-width:0"><div style="font-weight:700;color:#fff">#'+c.rank+' '+c.ticker+(on?' <span class="chip b" style="font-size:9px">ON YOUR LIST</span>':'')+'</div><div class="nm">'+esc(c.name)+' · '+sc.play+'</div></div>';
-    h+='<div style="text-align:right"><div class="'+(c.pct>=0?'up':'dn')+'" style="font-weight:700">'+(c.pct>=0?'+':'')+c.pct.toFixed(2)+'%</div><div style="font-size:11px;color:#6b7280">$'+c.price.toFixed(2)+'</div></div></div>';
-  });
-  document.getElementById('commc').innerHTML=h;
-}
-function filterComm(f,btn){commFilt=f;document.querySelectorAll('#t-comm .fp').forEach(function(b){b.classList.remove('on')});btn.classList.add('on');renderComm()}
-
-// ═════════════════════════════════════════════════════════════════
-// POLITICIAN TRADES
-// ═════════════════════════════════════════════════════════════════
-async function loadPols(){
-  document.getElementById('polc').innerHTML='<div class="ld"><div class="sp"></div><div style="font-size:13px;color:#5b6688">Fetching congressional trades…</div></div>';
-  var trades=[];
-  var data=await fetchJSON('https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json',20000);
-  if(Array.isArray(data)){
-    var cutoff=new Date();cutoff.setDate(cutoff.getDate()-60);
-    data.filter(function(t){return new Date(t.transaction_date)>cutoff&&t.ticker&&t.ticker!=='--'}).slice(0,100).forEach(function(t2){
-      var key=t2.transaction_date+(t2.representative||'')+(t2.ticker||'');
-      var sale=t2.type&&t2.type.indexOf('sale')>-1;
-      trades.push({name:t2.representative||'Congress Member',ticker:t2.ticker,type:t2.type||'purchase',amount:t2.amount||'',date:t2.transaction_date,isBuy:!sale,isNew:seenPols.indexOf(key)<0,key:key,age:timeAgo(t2.disclosure_date||t2.transaction_date),onWatchlist:!!wlOf(t2.ticker)});
-    });
-    trades.forEach(function(t3){if(seenPols.indexOf(t3.key)<0)seenPols.push(t3.key)});
-    lsSet('sp',seenPols.slice(-300));
-  }
-  polTrades=trades;
-  renderPolsSorted();
-}
-function sortPols(mode,btn){polSort=mode;document.querySelectorAll('#t-pols .fbar .fp').forEach(function(b){b.classList.remove('on')});btn.classList.add('on');if(polTrades.length)renderPolsSorted();else loadPols()}
-function renderPolsSorted(){
-  var sorted=polTrades.slice();
-  if(polSort==='new') sorted.sort(function(a,b){return new Date(b.date)-new Date(a.date)});
-  else if(polSort==='old') sorted.sort(function(a,b){return new Date(a.date)-new Date(b.date)});
-  else if(polSort==='wl') sorted.sort(function(a,b){return(b.onWatchlist?1:0)-(a.onWatchlist?1:0)});
-  else if(polSort==='buy') sorted=sorted.filter(function(t){return t.isBuy});
-  else if(polSort==='sell') sorted=sorted.filter(function(t){return!t.isBuy});
-  var h='';
-  if(!polTrades.length){document.getElementById('polc').innerHTML='<div class="es"><div class="ei">🏛</div><div class="et">Feed unavailable</div><div class="em">The House Stock Watcher dataset didn\'t load (or has no trades in the last 60 days).</div></div>';return}
-  var nc=sorted.filter(function(t){return t.isNew}).length;
-  if(nc) h+='<div class="bad" style="font-weight:600">🔔 '+nc+' new disclosure'+(nc>1?'s':'')+' since last visit</div>';
-  h+='<div class="note">'+sorted.length+' trades · disclosures lag up to 45 days, so price has often already moved</div>';
-  sorted.forEach(function(t){
-    h+='<div class="pol-card"><div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:6px">';
-    h+='<div><div style="font-size:13px;font-weight:700;color:#fff">'+esc(t.name)+(t.isNew?' <span class="chip r" style="font-size:9px">NEW</span>':'')+'</div><div style="font-size:11px;color:#5b6688">Traded '+t.date+' · '+t.age+'</div></div>';
-    h+='<span class="pb '+(t.isBuy?'ptb-buy':'ptb-sell')+'" style="text-align:center">'+esc(t.type.toUpperCase())+'<br>'+esc(t.ticker)+'</span></div>';
-    h+='<div class="chips"><span class="chip">'+esc(t.amount)+'</span>'+(t.onWatchlist?'<span class="chip b">⭐ On watchlist</span>':'')+'</div></div>';
-  });
-  document.getElementById('polc').innerHTML=h;
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -1721,7 +1581,7 @@ function renderToday(){
 // ═════════════════════════════════════════════════════════════════
 // TABS / HELPERS / TIMERS
 // ═════════════════════════════════════════════════════════════════
-var TABS=['today','bot','movers','strikes','swings','plan','holdings','calc','earn','econ','news','flow','comm','pols','wl'];
+var TABS=['today','bot','movers','strikes','swings','plan','holdings','calc','earn','news','flow','wl'];
 function sw(tab){
   CUR_TAB=tab;
   TABS.forEach(function(t){document.getElementById('t-'+t).style.display=(t===tab?'block':'none')});
@@ -1738,11 +1598,8 @@ function renderTab(tab){
   else if(tab==='plan') renderPlan();
   else if(tab==='holdings') renderHoldings();
   else if(tab==='earn') renderEarn();
-  else if(tab==='econ') renderEcon();
   else if(tab==='news'){renderNews();if(!allNews.length&&movers.length)loadNews()}
   else if(tab==='flow') renderFlow();
-  else if(tab==='comm') loadCrowd();
-  else if(tab==='pols'){if(!polTrades.length)loadPols();else renderPolsSorted()}
   else if(tab==='wl') renderWL();
 }
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
