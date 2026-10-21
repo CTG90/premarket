@@ -1,5 +1,15 @@
 # Changelog
 
+## Premarket Live — Oct 20 2026
+- New front page (index.html): live view of the big three (NVDA, AMZN, AAPL) plus a watchlist.
+- Streaming: with a free Finnhub key (Settings), every trade arrives over a WebSocket and the price, day range, 1-minute candle and position value update on each print. Without a key, Yahoo is polled every 6 s for the big three and every 30 s for the watchlist (was every 5 min).
+- Freshness is honest: each card shows the time of the last trade it has (not the fetch time), a draining bar, and flags quotes with no trade in 90 s.
+- Pre-market / after-hours price and change on every card and row.
+- Positions: shares and avg cost per holding (defaults 600 NVDA, 100 AMZN, 100 AAPL; reads avg cost from the Research Holdings tab), day P&L and total gain, big-three total.
+- Candlestick chart (1D live, 5D, 1M, 6M, 1Y) with previous-close and your-cost lines; headlines per ticker; next earnings date (Finnhub).
+- Keep-screen-on toggle, light/dark/auto theme, phone layout.
+- Old index.html moved to research.html (unchanged apart from a Live link). trade.html links to both.
+
 ## Speed fix — Oct 12 2026
 - Yahoo v7 quote endpoint needs a login crumb and was failing on every call; app tried it 3x per ticker before falling back. Now tried once per day, then skipped.
 - Dropped the direct-to-Yahoo attempt (always blocked by CORS from github.io).

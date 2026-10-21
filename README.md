@@ -1,10 +1,11 @@
 # Premarket Pro
 
-Two pages, same site, shared paper history:
+Three pages, same site:
+- **index.html — Premarket Live.** Big three (NVDA, AMZN, AAPL) and a watchlist, streaming. Add a free Finnhub key in Settings for tick-by-tick prices over WebSocket; without one it polls Yahoo every 6 s. Shows pre/after-hours, day range, positions and P&L, live candlestick chart, headlines, next earnings.
 - **trade.html — Make Me Trade.** One screen for trading: what to do now, signals, bot, track record. 10 tickers only (SPY QQQ NVDA AAPL AMZN MSFT META TSLA AMD PLTR). Refreshes every 3 min in market hours, keep-awake toggle for phones, browser alerts on every bot trade.
-- **index.html — Research.** Full dashboard: news, macro, earnings, holdings, swings, congress trades, crowd.
+- **research.html — Research.** Full dashboard: news, macro, earnings, holdings, swings, congress trades, crowd.
 
-Single-file options and stock trading dashboard with a paper-trading bot. No build step, no backend. Open `index.html` in a browser, or host it on GitHub Pages.
+Single-file pages, no build step, no backend. Open in a browser or host on GitHub Pages. The sections below describe the Research page (research.html).
 
 Live URL: https://ctg90.github.io/premarket/
 
@@ -27,8 +28,8 @@ Today, Bot, Movers, Strikes, Swings, Plan, Holdings, P&L, Earn, Macro, News, Flo
 - Data lives in this browser's localStorage. Export/Import JSON from the Bot tab.
 
 ## Deploy / edit workflow (GitHub Pages)
-1. The file at the repo root must be named exactly `index.html`.
-2. Edit it in place on GitHub (open file, pencil icon, paste, commit). Never upload a renamed copy.
+1. File names at the repo root are fixed: `index.html` (Live), `research.html`, `trade.html`.
+2. Edit them in place on GitHub (open file, pencil icon, paste, commit). Never upload a renamed copy.
 3. Wait about a minute, then hard-refresh.
 
 ## Known limits
